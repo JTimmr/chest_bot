@@ -1,0 +1,14 @@
+version: '3.8'
+
+services:
+  chest-bot:
+    build: .
+    container_name: chest-discord-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      # Mount .env file if you want to update it without rebuilding
+      - ./.env:/app/.env:ro
+      # Persist databases in a dedicated data folder
+      - ./data:/app/data
