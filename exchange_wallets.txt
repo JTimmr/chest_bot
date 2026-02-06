@@ -1,0 +1,4 @@
+# Exchange wallets
+# One wallet address per line. You can add a label after a space if you want.
+# Example:
+# Binance 7KbPKhNVbK7LPSP4yGs7JHyxe2Bb2dkXdsxxhCRuRoHa

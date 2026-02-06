@@ -1,9 +1,6 @@
 #!/usr/bin/env python3
 """
-Discord bot: maintains a permanent Top 30 holders message.
-
-Commands:
-  !setholderleaderboard #channel  -> post the message and keep updating it.
+Discord bot: maintains a permanent donation leaderboard message.
 """
 
 from __future__ import annotations
@@ -13,7 +10,7 @@ import os
 import sqlite3
 import time
 from datetime import datetime, timezone
-from typing import List, Tuple, Set
+from typing import List, Tuple, Set, Optional, Dict
 
 import discord
 from discord import app_commands
@@ -35,9 +32,14 @@ from incoming_tracker import (
     _init_transactions_db,
     _init_snapshot_db,
     _apply_donations,
+    _ensure_otp_registry,
+    _expire_otps,
+    _format_otp_if_exact,
+    _match_assigned_otp,
+    _record_used_otp,
 )
 
-load_dotenv()
+load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("holder_leaderboard")
@@ -48,6 +50,7 @@ STATE_DB = os.getenv("LEADERBOARD_STATE_DB", "/app/data/leaderboard_state.db")
 UPDATE_SECONDS = int(os.getenv("LEADERBOARD_UPDATE_SECONDS", "300"))
 DEFAULT_LIMIT = 30
 GUILD_ID = os.getenv("DISCORD_GUILD_ID")
+ENABLE_DM_COMMANDS = os.getenv("ENABLE_DM_COMMANDS", "").lower() in {"1", "true", "yes"}
 SNAPSHOT_WATCH_SECONDS = int(os.getenv("SNAPSHOT_WATCH_SECONDS", "10"))
 LEADERBOARD_REFRESH_COOLDOWN = int(os.getenv("LEADERBOARD_REFRESH_COOLDOWN_SECONDS", "10"))
 TRACKER_INTERVAL_SECONDS = int(os.getenv("TRACKER_INTERVAL_SECONDS", "30"))
@@ -55,6 +58,9 @@ TX_DB = os.getenv("TX_DB", "/app/data/incoming_transactions.db")
 TX_TABLE = os.getenv("TX_TABLE", "incoming_transactions")
 TX_LOOKUP_LIMIT = int(os.getenv("TX_LOOKUP_LIMIT", "50"))
 RPC_REQUEST_DELAY = float(os.getenv("RPC_REQUEST_DELAY", "0.1"))
+SUMMARY_TABLE = os.getenv("SUMMARY_TABLE", "verified_users")
+OTP_TABLE = os.getenv("OTP_TABLE", "otp_registry")
+OTP_EXPIRY_SECONDS = int(os.getenv("OTP_EXPIRY_SECONDS", "3600"))
 _SNAPSHOT_COLUMNS: Set[str] | None = None
 
 
@@ -82,6 +88,238 @@ def _ensure_snapshot_schema() -> None:
         log.error("Failed to ensure snapshot schema: %s", exc)
 
 
+def _ensure_snapshot_tables() -> None:
+    try:
+        with _connect_db(SNAPSHOT_DB) as conn:
+            _init_snapshot_db(conn, SNAPSHOT_TABLE)
+    except sqlite3.Error as exc:
+        log.error("Failed to ensure snapshot tables: %s", exc)
+
+
+def _ensure_summary_schema() -> None:
+    try:
+        with _connect_db(SNAPSHOT_DB) as conn:
+            conn.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {SUMMARY_TABLE} (
+                    discord_id TEXT PRIMARY KEY,
+                    discord_name TEXT,
+                    wallets TEXT,
+                    total_holdings REAL NOT NULL DEFAULT 0,
+                    total_donated_usd REAL NOT NULL DEFAULT 0,
+                    leaderboard_visible INTEGER NOT NULL DEFAULT 0,
+                    roles TEXT,
+                    updated_at TEXT
+                )
+                """
+            )
+            existing_cols = {
+                row[1] for row in conn.execute(f"PRAGMA table_info({SUMMARY_TABLE})")
+            }
+            if "roles" not in existing_cols:
+                conn.execute(f"ALTER TABLE {SUMMARY_TABLE} ADD COLUMN roles TEXT")
+            if "anonymous_id" not in existing_cols:
+                conn.execute(f"ALTER TABLE {SUMMARY_TABLE} ADD COLUMN anonymous_id INTEGER")
+            conn.commit()
+    except sqlite3.Error as exc:
+        log.error("Failed to ensure summary schema: %s", exc)
+
+
+def _ensure_otp_schema() -> None:
+    try:
+        with _connect_db(SNAPSHOT_DB) as conn:
+            _ensure_otp_registry(conn)
+            _expire_otps(conn)
+    except sqlite3.Error as exc:
+        log.error("Failed to ensure OTP schema: %s", exc)
+
+
+ 
+
+
+def _ensure_exchange_wallets_schema() -> None:
+    try:
+        with _connect_db(SNAPSHOT_DB) as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS exchange_wallets (
+                    wallet_address TEXT PRIMARY KEY,
+                    exchange_name TEXT,
+                    added_at TEXT,
+                    anonymous_id INTEGER
+                )
+                """
+            )
+            existing_cols = {
+                row[1] for row in conn.execute("PRAGMA table_info(exchange_wallets)")
+            }
+            if "anonymous_id" not in existing_cols:
+                conn.execute("ALTER TABLE exchange_wallets ADD COLUMN anonymous_id INTEGER")
+            conn.commit()
+    except sqlite3.Error as exc:
+        log.error("Failed to ensure exchange wallets schema: %s", exc)
+
+
+def _get_exchange_wallets() -> Set[str]:
+    try:
+        with _connect_db(SNAPSHOT_DB) as conn:
+            _ensure_exchange_wallets_schema()
+            rows = conn.execute(
+                "SELECT wallet_address FROM exchange_wallets"
+            ).fetchall()
+        return {row[0] for row in rows if row and row[0]}
+    except sqlite3.Error as exc:
+        log.error("Failed to load exchange wallets: %s", exc)
+        return set()
+
+
+def _allocate_otp(discord_id: str, discord_name: str) -> Optional[Tuple[str, int]]:
+    try:
+        with _connect_db(SNAPSHOT_DB) as conn:
+            _ensure_otp_registry(conn)
+            _expire_otps(conn)
+            existing = conn.execute(
+                f"""
+                SELECT otp_value, tick_size
+                FROM {OTP_TABLE}
+                WHERE assigned_to_discord_id = ?
+                  AND status = 'assigned'
+                """,
+                (discord_id,),
+            ).fetchone()
+            if existing:
+                return existing[0], int(existing[1])
+
+            # Determine tick size based on usage.
+            used_count = conn.execute(
+                f"SELECT COUNT(1) FROM {OTP_TABLE} WHERE tick_size = 5"
+            ).fetchone()[0]
+            tick = 6 if used_count >= 95000 else 5
+
+            import secrets
+
+            attempts = 0
+            while attempts < 2000:
+                attempts += 1
+                max_val = 999999 if tick == 6 else 99999
+                n = secrets.randbelow(max_val) + 1
+                otp_value = f"0.{n:0{tick}d}"
+                cur = conn.execute(
+                    f"""
+                    INSERT OR IGNORE INTO {OTP_TABLE} (
+                        otp_value, tick_size, status,
+                        assigned_to_discord_id, assigned_to_name, assigned_at
+                    )
+                    VALUES (?, ?, 'assigned', ?, ?, datetime('now'))
+                    """,
+                    (otp_value, tick, discord_id, discord_name),
+                )
+                if cur.rowcount == 1:
+                    conn.commit()
+                    return otp_value, tick
+
+            # If exhausted at 5-decimal, retry at 6 decimals.
+            if tick == 5:
+                tick = 6
+                attempts = 0
+                while attempts < 5000:
+                    attempts += 1
+                    n = secrets.randbelow(999999) + 1
+                    otp_value = f"0.{n:06d}"
+                    cur = conn.execute(
+                        f"""
+                        INSERT OR IGNORE INTO {OTP_TABLE} (
+                            otp_value, tick_size, status,
+                            assigned_to_discord_id, assigned_to_name, assigned_at
+                        )
+                        VALUES (?, ?, 'assigned', ?, ?, datetime('now'))
+                        """,
+                        (otp_value, tick, discord_id, discord_name),
+                    )
+                    if cur.rowcount == 1:
+                        conn.commit()
+                        return otp_value, tick
+            return None
+    except sqlite3.Error as exc:
+        log.error("Failed to allocate OTP: %s", exc)
+        return None
+
+
+def _parse_sqlite_dt(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        return datetime.strptime(value, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def _format_remaining(assigned_at: Optional[str]) -> str:
+    assigned_dt = _parse_sqlite_dt(assigned_at)
+    if not assigned_dt:
+        return f"{OTP_EXPIRY_SECONDS // 60} minutes"
+    now = datetime.now(timezone.utc)
+    remaining = OTP_EXPIRY_SECONDS - int((now - assigned_dt).total_seconds())
+    if remaining <= 0:
+        return "0m 0s"
+    minutes = remaining // 60
+    seconds = remaining % 60
+    return f"{minutes}m {seconds}s"
+
+
+def _is_leaderboard_visible(discord_id: str) -> bool:
+    try:
+        with _connect_db(SNAPSHOT_DB) as conn:
+            row = conn.execute(
+                f"""
+                SELECT leaderboard_visible
+                FROM {SUMMARY_TABLE}
+                WHERE discord_id = ?
+                """,
+                (discord_id,),
+            ).fetchone()
+        return bool(row and row[0])
+    except sqlite3.Error:
+        return False
+
+
+def _reminder_text() -> str:
+    return (
+        "Reminder: you are not on the leaderboard yet. "
+        "Use /leaderboardvisibility if you want your name shown. "
+        "You can also remove yourself anytime to make your donations anonymous again. "
+        "This is voluntary and does not affect any perks."
+    )
+
+
+def _discord_time_from_sqlite(value: Optional[str]) -> str:
+    dt = _parse_sqlite_dt(value)
+    if not dt:
+        return "unknown time"
+    return f"<t:{int(dt.timestamp())}:f>"
+
+
+def _discord_time_from_value(value: Optional[object]) -> str:
+    if value is None:
+        return "unknown time"
+    if isinstance(value, (int, float)):
+        return f"<t:{int(value)}:f>"
+    if isinstance(value, str):
+        dt = _parse_sqlite_dt(value)
+        if not dt:
+            try:
+                normalized = value.replace("Z", "+00:00")
+                dt = datetime.fromisoformat(normalized)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+            except ValueError:
+                dt = None
+        if dt:
+            return f"<t:{int(dt.timestamp())}:f>"
+    return "unknown time"
+
+
+
 def _init_state_db() -> None:
     with _connect_db(STATE_DB) as conn:
         existing_cols = {
@@ -104,8 +342,8 @@ def _init_state_db() -> None:
             """
             INSERT OR IGNORE INTO leaderboard_state (leaderboard_type, display_limit)
             VALUES
-                ('holders', ?),
-                ('donations', ?)
+                ('donations', ?),
+                ('recent', ?)
             """,
             (DEFAULT_LIMIT, DEFAULT_LIMIT),
         )
@@ -156,116 +394,95 @@ def _set_limit(leaderboard_type: str, display_limit: int) -> None:
         conn.commit()
 
 
-def _fetch_top_holders(limit: int = DEFAULT_LIMIT) -> List[Tuple[str, float, str | None, str | None, int]]:
-    try:
-        cols = _get_snapshot_columns()
-        with _connect_db(SNAPSHOT_DB) as conn:
-            select_cols = ["wallet_address", "amount_fartboy"]
-            select_cols.append("discord_id" if "discord_id" in cols else "NULL AS discord_id")
-            select_cols.append("discord_name" if "discord_name" in cols else "NULL AS discord_name")
-            select_cols.append("on_leaderboard" if "on_leaderboard" in cols else "0 AS on_leaderboard")
-            rows = conn.execute(
-                f"""
-                SELECT {", ".join(select_cols)}
-                FROM {SNAPSHOT_TABLE}
-                ORDER BY amount_fartboy DESC,
-                         on_leaderboard DESC,
-                         CASE WHEN discord_id IS NULL THEN 0 ELSE 1 END DESC
-                LIMIT ?
-                """,
-                (limit,),
-            ).fetchall()
-        return [(r[0], float(r[1]), r[2], r[3], int(r[4] or 0)) for r in rows]
-    except sqlite3.Error as exc:
-        log.error("Failed to read snapshot DB %s:%s - %s", SNAPSHOT_DB, SNAPSHOT_TABLE, exc)
-        return []
-
-
 def _format_wallet(addr: str) -> str:
     return addr[:8] if addr else "UNKNOWN"
 
 
-def _render_holders_embed(limit: int) -> discord.Embed:
-    holders = _fetch_top_holders(limit)
-    emb = discord.Embed(
-        title=f"Top {limit} FARTBOY Holders",
-        color=0x00D18F,
-        timestamp=datetime.now(timezone.utc),
-    )
-    if not holders:
-        emb.add_field(name="No data", value="No holders found in snapshot database.", inline=False)
-        emb.set_footer(text="Updated")
-        return emb
-
-    lines = []
-    for idx, (wallet, amount, discord_id, discord_name, on_leaderboard) in enumerate(holders, start=1):
-        display = _format_wallet(wallet)
-        if on_leaderboard and (discord_name or discord_id):
-            display = discord_name or f"<@{discord_id}>"
-        lines.append(f"{idx:>2}. {display} — {amount:,.4f}")
-    emb.add_field(name="Leaderboard", value="\n".join(lines), inline=False)
-    emb.set_footer(text="Updated")
-    return emb
+def _wrap_label(text: str, width: int = 18) -> List[str]:
+    if not text:
+        return [""]
+    text = str(text)
+    return [text[i : i + width] for i in range(0, len(text), width)]
 
 
-def _fetch_top_donors(limit: int = DEFAULT_LIMIT) -> List[Tuple[str, float, str | None, str | None, int]]:
+def _fetch_donors(limit: Optional[int] = None) -> List[Tuple[str, float, str | None, str | None, int]]:
     try:
-        cols = _get_snapshot_columns()
         with _connect_db(SNAPSHOT_DB) as conn:
-            select_cols = ["wallet_address", "donated_usd"]
-            select_cols.append("discord_id" if "discord_id" in cols else "NULL AS discord_id")
-            select_cols.append("discord_name" if "discord_name" in cols else "NULL AS discord_name")
-            select_cols.append("on_leaderboard" if "on_leaderboard" in cols else "0 AS on_leaderboard")
-            rows = conn.execute(
+            summary_rows = conn.execute(
                 f"""
-                SELECT {", ".join(select_cols)}
-                FROM {SNAPSHOT_TABLE}
+                SELECT discord_id, discord_name, total_donated_usd, leaderboard_visible, anonymous_id
+                FROM {SUMMARY_TABLE}
                 """,
             ).fetchall()
-        aggregated: dict[str, dict] = {}
-        singles: List[Tuple[str, float, str | None, str | None, int]] = []
-        for wallet, donated_usd, discord_id, discord_name, on_leaderboard in rows:
-            donated_usd = float(donated_usd or 0)
-            on_leaderboard = int(on_leaderboard or 0)
-            if discord_id and on_leaderboard:
-                key = str(discord_id)
-                entry = aggregated.get(key)
-                if not entry:
-                    aggregated[key] = {
-                        "wallet": wallet,
-                        "donated_usd": donated_usd,
-                        "discord_id": discord_id,
-                        "discord_name": discord_name,
-                        "on_leaderboard": on_leaderboard,
-                    }
-                else:
-                    entry["donated_usd"] += donated_usd
-                    if not entry.get("discord_name") and discord_name:
-                        entry["discord_name"] = discord_name
-            else:
-                singles.append((wallet, donated_usd, discord_id, discord_name, on_leaderboard))
+            snapshot_rows = conn.execute(
+                f"""
+                SELECT wallet_address, donated_usd, discord_id
+                FROM {SNAPSHOT_TABLE}
+                WHERE donated_usd > 0
+                """,
+            ).fetchall()
+            exchange_rows = conn.execute(
+                "SELECT wallet_address FROM exchange_wallets"
+            ).fetchall()
 
+        exchange_wallets = {r[0] for r in exchange_rows if r and r[0]}
         combined: List[Tuple[str, float, str | None, str | None, int]] = []
-        for entry in aggregated.values():
-            combined.append(
-                (
-                    entry["wallet"],
-                    float(entry["donated_usd"]),
-                    entry["discord_id"],
-                    entry["discord_name"],
-                    int(entry["on_leaderboard"]),
-                )
-            )
-        combined.extend(singles)
 
-        combined.sort(
-            key=lambda r: (r[1], r[4], 1 if r[2] else 0),
-            reverse=True,
-        )
-        return combined[:limit]
+        # Aggregate verified users using summary rows.
+        for (
+            discord_id,
+            discord_name,
+            total_donated_usd,
+            leaderboard_visible,
+            anonymous_id,
+        ) in summary_rows:
+            if not discord_id:
+                continue
+            if int(leaderboard_visible or 0) == 1:
+                combined.append(
+                    ("", float(total_donated_usd or 0), discord_id, discord_name, 1)
+                )
+            else:
+                anon_id = int(anonymous_id or 0) or _get_or_create_anonymous_id(discord_id)
+                combined.append(
+                    (
+                        f"Anonymous donor {anon_id}",
+                        float(total_donated_usd or 0),
+                        None,
+                        None,
+                        0,
+                    )
+                )
+
+        # Add unverified wallets (including verified users with visibility off).
+        for wallet, donated_usd, discord_id in snapshot_rows:
+            if discord_id:
+                continue
+            if wallet in exchange_wallets:
+                continue
+            combined.append((wallet, float(donated_usd or 0), None, None, 0))
+
+        combined.sort(key=lambda r: r[1], reverse=True)
+        return combined if limit is None else combined[:limit]
     except sqlite3.Error as exc:
         log.error("Failed to read snapshot DB %s:%s - %s", SNAPSHOT_DB, SNAPSHOT_TABLE, exc)
         return []
+
+
+def _fetch_top_donors(limit: int = DEFAULT_LIMIT) -> List[Tuple[str, float, str | None, str | None, int]]:
+    return _fetch_donors(limit)
+
+
+def _fetch_total_donations_usd() -> float:
+    try:
+        with sqlite3.connect(TX_DB) as conn:
+            row = conn.execute(
+                f"SELECT SUM(value_usdc) FROM {TX_TABLE}"
+            ).fetchone()
+        return float(row[0] or 0)
+    except sqlite3.Error as exc:
+        log.error("Failed to total donations from %s:%s - %s", TX_DB, TX_TABLE, exc)
+        return 0.0
 
 
 def _get_snapshot_columns() -> Set[str]:
@@ -299,6 +516,131 @@ def _find_wallets_for_discord_id(discord_id: str) -> List[str]:
         return []
 
 
+def _discord_id_for_wallet(wallet: str) -> str | None:
+    try:
+        with _connect_db(SNAPSHOT_DB) as conn:
+            row = conn.execute(
+                f"""
+                SELECT discord_id
+                FROM {SNAPSHOT_TABLE}
+                WHERE wallet_address = ?
+                """,
+                (wallet,),
+            ).fetchone()
+        return row[0] if row and row[0] else None
+    except sqlite3.Error:
+        return None
+
+
+def _recompute_summary_for_discord_id(discord_id: str) -> None:
+    try:
+        with _connect_db(SNAPSHOT_DB) as conn:
+            wallets = conn.execute(
+                f"""
+                SELECT wallet_address, amount_fartboy, donated_usd, discord_name
+                FROM {SNAPSHOT_TABLE}
+                WHERE discord_id = ?
+                """,
+                (discord_id,),
+            ).fetchall()
+            if not wallets:
+                return
+            total_holdings = sum(float(r[1] or 0) for r in wallets)
+            total_donated_usd = sum(float(r[2] or 0) for r in wallets)
+            discord_name = next((r[3] for r in wallets if r[3]), None)
+            wallet_list = ",".join(sorted({r[0] for r in wallets if r[0]}))
+
+            existing = conn.execute(
+                f"""
+                SELECT leaderboard_visible, roles
+                FROM {SUMMARY_TABLE}
+                WHERE discord_id = ?
+                """,
+                (discord_id,),
+            ).fetchone()
+            leaderboard_visible = int(existing[0]) if existing else 0
+            roles = existing[1] if existing else None
+            conn.execute(
+                f"""
+                INSERT INTO {SUMMARY_TABLE} (
+                    discord_id, discord_name, wallets, total_holdings,
+                    total_donated_usd, leaderboard_visible, roles, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
+                ON CONFLICT(discord_id) DO UPDATE SET
+                    discord_name = excluded.discord_name,
+                    wallets = excluded.wallets,
+                    total_holdings = excluded.total_holdings,
+                    total_donated_usd = excluded.total_donated_usd,
+                    updated_at = datetime('now')
+                """,
+                (
+                    discord_id,
+                    discord_name,
+                    wallet_list,
+                    total_holdings,
+                    total_donated_usd,
+                    leaderboard_visible,
+                    roles,
+                ),
+            )
+            conn.commit()
+    except sqlite3.Error as exc:
+        log.error("Failed to recompute summary: %s", exc)
+
+
+def _set_summary_visibility(discord_id: str, visible: int) -> None:
+    try:
+        with _connect_db(SNAPSHOT_DB) as conn:
+            conn.execute(
+                f"""
+                INSERT INTO {SUMMARY_TABLE} (discord_id, leaderboard_visible, updated_at)
+                VALUES (?, ?, datetime('now'))
+                ON CONFLICT(discord_id) DO UPDATE SET
+                    leaderboard_visible = excluded.leaderboard_visible,
+                    updated_at = datetime('now')
+                """,
+                (discord_id, visible),
+            )
+            conn.commit()
+    except sqlite3.Error as exc:
+        log.error("Failed to set summary visibility: %s", exc)
+
+
+def _get_or_create_anonymous_id(discord_id: str) -> int:
+    try:
+        with _connect_db(SNAPSHOT_DB) as conn:
+            row = conn.execute(
+                f"""
+                SELECT anonymous_id
+                FROM {SUMMARY_TABLE}
+                WHERE discord_id = ?
+                """,
+                (discord_id,),
+            ).fetchone()
+            if row and row[0]:
+                return int(row[0])
+            row = conn.execute(
+                f"SELECT MAX(anonymous_id) FROM {SUMMARY_TABLE}"
+            ).fetchone()
+            next_id = int(row[0] or 0) + 1
+            conn.execute(
+                f"""
+                INSERT INTO {SUMMARY_TABLE} (discord_id, anonymous_id, updated_at)
+                VALUES (?, ?, datetime('now'))
+                ON CONFLICT(discord_id) DO UPDATE SET
+                    anonymous_id = excluded.anonymous_id,
+                    updated_at = datetime('now')
+                """,
+                (discord_id, next_id),
+            )
+            conn.commit()
+            return next_id
+    except sqlite3.Error as exc:
+        log.error("Failed to assign anonymous id: %s", exc)
+        return 0
+
+
 def _fetch_transactions_for_wallet(wallet: str, limit: int) -> List[dict]:
     try:
         with sqlite3.connect(TX_DB) as conn:
@@ -329,7 +671,49 @@ def _fetch_transactions_for_wallet(wallet: str, limit: int) -> List[dict]:
         return []
 
 
-async def _process_signature(signature: str) -> Tuple[int, int]:
+def _fetch_transactions_for_discord_id(discord_id: str, limit: int) -> List[dict]:
+    try:
+        with sqlite3.connect(TX_DB) as conn:
+            rows = conn.execute(
+                f"""
+                SELECT timestamp, amount_ui, token, value_usdc, value_fartboy, sender_wallet
+                FROM {TX_TABLE}
+                WHERE discord_id = ?
+                ORDER BY timestamp DESC
+                LIMIT ?
+                """,
+                (discord_id, limit),
+            ).fetchall()
+        results = []
+        for ts, amount_ui, token, value_usdc, value_fartboy, sender_wallet in rows:
+            results.append(
+                {
+                    "timestamp": ts,
+                    "amount_ui": amount_ui,
+                    "token": token,
+                    "value_usdc": value_usdc,
+                    "value_fartboy": value_fartboy,
+                    "wallet": sender_wallet,
+                }
+            )
+        return results
+    except sqlite3.Error as exc:
+        log.error("Failed to read transactions DB by discord_id: %s", exc)
+        return []
+
+
+def _fetch_transactions_for_wallets(wallets: List[str], limit: int) -> List[dict]:
+    results: List[dict] = []
+    for wallet in wallets:
+        rows = _fetch_transactions_for_wallet(wallet, limit)
+        for row in rows:
+            row["wallet"] = wallet
+        results.extend(rows)
+    # Sort by timestamp string (ISO) desc; fall back to original order if missing.
+    results.sort(key=lambda r: r.get("timestamp") or "", reverse=True)
+    return results[:limit]
+
+async def _process_signature(signature: str, discord_id: str | None = None) -> Tuple[int, int]:
     api_key = os.getenv("HELIUS_API_KEY")
     fartboy_mint = os.getenv("FARTBOY_MINT")
     target_wallet = os.getenv("WARCHEST_ADDRESS")
@@ -373,7 +757,7 @@ async def _process_signature(signature: str) -> Tuple[int, int]:
             source_owner = token_map.get(source, {}).get("owner")
             if not destination_owner or not source_owner:
                 continue
-            if destination_owner != target_wallet:
+            if destination_owner != target_wallet and destination != target_wallet:
                 continue
             if mint not in allowed_spl_mints:
                 continue
@@ -383,6 +767,7 @@ async def _process_signature(signature: str) -> Tuple[int, int]:
                     "timestamp": tx.get("blockTime"),
                     "amount_raw": amount_raw,
                     "amount_ui": _ui_amount(amount_raw, decimals),
+                    "decimals": decimals,
                     "token": "FARTBOY" if mint == fartboy_mint else "USDC",
                     "sender_wallet": source_owner,
                 }
@@ -393,21 +778,29 @@ async def _process_signature(signature: str) -> Tuple[int, int]:
 
     computed = await _compute_values_for_rows(rows, fartboy_mint)
     if not computed:
-        return len(rows), 0
+        computed = []
 
     inserted = 0
+    exchange_wallets = _get_exchange_wallets()
     with sqlite3.connect(TX_DB) as tx_conn, sqlite3.connect(SNAPSHOT_DB) as snapshot_conn:
         _init_transactions_db(tx_conn, TX_TABLE)
         _init_snapshot_db(snapshot_conn, SNAPSHOT_TABLE)
+        _ensure_otp_registry(snapshot_conn)
+        _expire_otps(snapshot_conn)
         for row, value_usdc, value_fartboy in computed:
+            row_discord_id = (
+                discord_id
+                if discord_id and row.get("sender_wallet") not in exchange_wallets
+                else None
+            )
             cur = tx_conn.cursor()
             cur.execute(
                 f"""
                 INSERT OR IGNORE INTO {TX_TABLE} (
                     signature, timestamp, sender_wallet, token, amount_raw,
-                    amount_ui, value_usdc, value_fartboy
+                    amount_ui, value_usdc, value_fartboy, discord_id
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     row["signature"],
@@ -418,6 +811,7 @@ async def _process_signature(signature: str) -> Tuple[int, int]:
                     row["amount_ui"],
                     value_usdc,
                     value_fartboy,
+                    row_discord_id,
                 ),
             )
             tx_conn.commit()
@@ -430,6 +824,66 @@ async def _process_signature(signature: str) -> Tuple[int, int]:
                     value_fartboy,
                     value_usdc,
                 )
+            if row_discord_id:
+                tx_conn.execute(
+                    f"""
+                    UPDATE {TX_TABLE}
+                    SET discord_id = ?
+                    WHERE signature = ?
+                      AND sender_wallet = ?
+                      AND token = ?
+                      AND amount_raw = ?
+                    """,
+                    (
+                        row_discord_id,
+                        row["signature"],
+                        row["sender_wallet"],
+                        row["token"],
+                        row["amount_raw"],
+                    ),
+                )
+                tx_conn.commit()
+        # Always attempt OTP matching for small FARTBOY transfers, even if the
+        # transaction already exists or pricing was unavailable.
+        for row in rows:
+            if row.get("token") != "FARTBOY" or row.get("amount_ui", 0) >= 1:
+                continue
+            if row.get("sender_wallet") in exchange_wallets:
+                continue
+            decimals = int(row.get("decimals", 0))
+            amount_raw = int(row.get("amount_raw", 0))
+            for tick in (5, 6):
+                otp_value = _format_otp_if_exact(amount_raw, decimals, tick)
+                if not otp_value:
+                    continue
+                matched = _match_assigned_otp(
+                    snapshot_conn,
+                    otp_value,
+                    tick,
+                    row["signature"],
+                    row["sender_wallet"],
+                )
+                if matched:
+                    discord_id, discord_name = matched
+                    snapshot_conn.execute(
+                        f"""
+                        UPDATE {SNAPSHOT_TABLE}
+                        SET discord_id = ?, discord_name = ?, on_leaderboard = 0
+                        WHERE wallet_address = ?
+                          AND (discord_id IS NULL OR discord_id = ?)
+                        """,
+                        (discord_id, discord_name, row["sender_wallet"], discord_id),
+                    )
+                    snapshot_conn.commit()
+                    _recompute_summary_for_discord_id(discord_id)
+                else:
+                    _record_used_otp(
+                        snapshot_conn,
+                        otp_value,
+                        tick,
+                        row["signature"],
+                        row["sender_wallet"],
+                    )
     return len(rows), inserted
 
 
@@ -536,10 +990,16 @@ def _update_visibility_by_discord(
 
 def _render_donations_embed(limit: int) -> discord.Embed:
     donors = _fetch_top_donors(limit)
+    total_donations = _fetch_total_donations_usd()
     emb = discord.Embed(
         title=f"Top {limit} Donations",
         color=0xFFD166,
         timestamp=datetime.now(timezone.utc),
+    )
+    emb.add_field(
+        name="Total donations",
+        value=f"${total_donations:,.2f}",
+        inline=False,
     )
     if not donors:
         emb.add_field(name="No data", value="No donations recorded yet.", inline=False)
@@ -547,14 +1007,217 @@ def _render_donations_embed(limit: int) -> discord.Embed:
         return emb
 
     lines = []
-    for idx, (wallet, donated_usd, discord_id, discord_name, on_leaderboard) in enumerate(donors, start=1):
-        display = _format_wallet(wallet)
-        if on_leaderboard and (discord_name or discord_id):
+    for idx, (wallet, donated_usd, discord_id, discord_name, _on_leaderboard) in enumerate(donors, start=1):
+        if discord_id:
             display = discord_name or f"<@{discord_id}>"
-        lines.append(f"{idx:>2}. {display} — ${donated_usd:,.2f}")
+        elif wallet and (" " in wallet or wallet.startswith("Anonymous donor")):
+            display = wallet
+        else:
+            display = _format_wallet(wallet)
+        label_lines = _wrap_label(display, 24)
+        if len(label_lines) == 1:
+            lines.append(f"{idx:>2}. {label_lines[0]}  —  ${donated_usd:,.2f}")
+        else:
+            lines.append(f"{idx:>2}. {label_lines[0]}")
+            for extra in label_lines[1:]:
+                lines.append(f"    {extra}")
+            lines.append(f"    ${donated_usd:,.2f}")
     emb.add_field(name="Leaderboard", value="\n".join(lines), inline=False)
     emb.set_footer(text="Updated")
     return emb
+
+
+def _render_recent_transactions_embed(limit: int = 20) -> discord.Embed:
+    emb = discord.Embed(
+        title="Recent Incoming Transactions",
+        color=0x4EA8DE,
+        timestamp=datetime.now(timezone.utc),
+    )
+    try:
+        with sqlite3.connect(TX_DB) as conn:
+            rows = conn.execute(
+                f"""
+                SELECT timestamp, amount_ui, token, value_usdc
+                FROM {TX_TABLE}
+                ORDER BY timestamp DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+    except sqlite3.Error:
+        rows = []
+
+    if not rows:
+        emb.add_field(name="No data", value="No transactions recorded yet.", inline=False)
+        emb.set_footer(text="Updated")
+        return emb
+
+    lines = []
+    for ts, amount_ui, token, value_usdc in rows:
+        ts_display = _discord_time_from_value(ts)
+        lines.append(f"{ts_display} | ${value_usdc:,.6f} | {amount_ui:g} {token}")
+    emb.add_field(
+        name="Latest",
+        value="Time | Value | Amount\n" + "\n".join(lines),
+        inline=False,
+    )
+    emb.set_footer(text="Updated")
+    return emb
+
+
+class DonationLeaderboardPager(discord.ui.View):
+    def __init__(
+        self,
+        owner_id: int,
+        donors: List[Tuple[str, float, str | None, str | None, int]],
+        page_size: int = 20,
+    ) -> None:
+        super().__init__(timeout=180)
+        self.owner_id = owner_id
+        self.donors = donors
+        self.page_size = max(5, min(page_size, 50))
+        self.page = 0
+        self._update_buttons()
+
+    def _update_buttons(self) -> None:
+        self.prev_button.disabled = self.page <= 0
+        total_pages = max(1, (len(self.donors) + self.page_size - 1) // self.page_size)
+        self.next_button.disabled = self.page >= (total_pages - 1)
+
+    def _render_page(self) -> str:
+        if not self.donors:
+            return "No donations recorded yet."
+        start = self.page * self.page_size
+        end = start + self.page_size
+        chunk = self.donors[start:end]
+        total_pages = max(1, (len(self.donors) + self.page_size - 1) // self.page_size)
+        lines = [f"All donations — page {self.page + 1}/{total_pages}"]
+        for idx, (wallet, donated_usd, discord_id, discord_name, _on_leaderboard) in enumerate(
+            chunk, start=start + 1
+        ):
+            if discord_id:
+                display = discord_name or f"<@{discord_id}>"
+            elif wallet and (" " in wallet or wallet.startswith("Anonymous donor")):
+                display = wallet
+            else:
+                display = _format_wallet(wallet)
+            label_lines = _wrap_label(display, 24)
+            if len(label_lines) == 1:
+                lines.append(f"{idx:>3}. {label_lines[0]}  —  ${donated_usd:,.2f}")
+            else:
+                lines.append(f"{idx:>3}. {label_lines[0]}")
+                for extra in label_lines[1:]:
+                    lines.append(f"     {extra}")
+                lines.append(f"     ${donated_usd:,.2f}")
+        return "\n".join(lines)
+
+    async def _gate(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                "This leaderboard view is only for the user who opened it.",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    @discord.ui.button(label="Prev", style=discord.ButtonStyle.secondary)
+    async def prev_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        if not await self._gate(interaction):
+            return
+        self.page = max(0, self.page - 1)
+        self._update_buttons()
+        await interaction.response.edit_message(content=self._render_page(), view=self)
+
+    @discord.ui.button(label="Next", style=discord.ButtonStyle.secondary)
+    async def next_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        if not await self._gate(interaction):
+            return
+        total_pages = max(1, (len(self.donors) + self.page_size - 1) // self.page_size)
+        self.page = min(total_pages - 1, self.page + 1)
+        self._update_buttons()
+        await interaction.response.edit_message(content=self._render_page(), view=self)
+
+
+class VerificationButtonsView(discord.ui.View):
+    def __init__(self) -> None:
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Verify wallet",
+        style=discord.ButtonStyle.primary,
+        custom_id="verify_wallet_button",
+        row=0,
+    )
+    async def verify_wallet_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        await interaction.response.send_message(
+            "To verify your wallet, run `/verifywallet` here. "
+            "This is private and only visible to you.",
+            ephemeral=True,
+        )
+
+    @discord.ui.button(
+        label="Verify status",
+        style=discord.ButtonStyle.secondary,
+        custom_id="verify_status_button",
+        row=1,
+    )
+    async def verify_status_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        await verify_status.callback(interaction)
+
+    @discord.ui.button(
+        label="My wallets",
+        style=discord.ButtonStyle.secondary,
+        custom_id="my_wallets_button",
+        row=1,
+    )
+    async def my_wallets_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        await my_wallets.callback(interaction)
+
+    @discord.ui.button(
+        label="My transactions",
+        style=discord.ButtonStyle.secondary,
+        custom_id="my_transactions_button",
+        row=1,
+    )
+    async def my_transactions_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        await my_transactions.callback(interaction)
+
+    @discord.ui.button(
+        label="Leaderboard visibility",
+        style=discord.ButtonStyle.secondary,
+        custom_id="leaderboard_visibility_button",
+        row=2,
+    )
+    async def leaderboard_visibility_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        await interaction.response.send_message(
+            "To change your leaderboard visibility, run `/leaderboardvisibility` here.",
+            ephemeral=True,
+        )
+
+    @discord.ui.button(
+        label="Full leaderboard",
+        style=discord.ButtonStyle.secondary,
+        custom_id="full_leaderboard_button",
+        row=2,
+    )
+    async def full_leaderboard_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        await leaderboard_full.callback(interaction)
 
 
 class LeaderboardBot(commands.Bot):
@@ -563,12 +1226,17 @@ class LeaderboardBot(commands.Bot):
         _init_state_db()
         self._last_snapshot_mtime = 0.0
         self._last_refresh_ts = 0.0
-        self._last_render_hash: dict[str, int] = {"holders": 0, "donations": 0}
+        self._last_render_hash: dict[str, int] = {"donations": 0, "recent": 0}
         self._tracker: IncomingTracker | None = None
         self._tracker_disabled_logged = False
 
     async def setup_hook(self) -> None:
+        _ensure_snapshot_tables()
         _ensure_snapshot_schema()
+        _ensure_summary_schema()
+        _ensure_otp_schema()
+        _ensure_exchange_wallets_schema()
+        self.add_view(VerificationButtonsView())
         if not self._tracker:
             api_key = os.getenv("HELIUS_API_KEY")
             fartboy_mint = os.getenv("FARTBOY_MINT")
@@ -589,22 +1257,41 @@ class LeaderboardBot(commands.Bot):
                     missing.append("WARCHEST_ADDRESS")
                 log.warning("Tracker disabled. Missing: %s", ", ".join(missing))
         if GUILD_ID:
-            # Clear any global commands to avoid duplicates.
-            self.tree.clear_commands(guild=None)
-            await self.tree.sync()
-            guild = discord.Object(id=int(GUILD_ID))
-            self.tree.clear_commands(guild=guild)
-            self.tree.add_command(verify_wallet, guild=guild)
-            self.tree.add_command(set_leaderboard_visibility, guild=guild)
-            self.tree.add_command(check_wallet, guild=guild)
-            self.tree.add_command(my_transactions, guild=guild)
-            await self.tree.sync(guild=guild)
-            log.info("Slash commands synced to guild %s", GUILD_ID)
+            if ENABLE_DM_COMMANDS:
+                # Avoid duplicate commands in guild by using global commands only.
+                guild = discord.Object(id=int(GUILD_ID))
+                self.tree.clear_commands(guild=guild)
+                await self.tree.sync(guild=guild)
+                self.tree.clear_commands(guild=None)
+                self.tree.add_command(set_leaderboard_visibility)
+                self.tree.add_command(my_transactions)
+                self.tree.add_command(my_wallets)
+                self.tree.add_command(verify_wallet_otp)
+                self.tree.add_command(verify_status)
+                self.tree.add_command(leaderboard_full)
+                await self.tree.sync()
+                log.info("Slash commands synced globally (DMs enabled).")
+            else:
+                # Clear any global commands to avoid duplicates or stale commands.
+                self.tree.clear_commands(guild=None)
+                await self.tree.sync()
+                guild = discord.Object(id=int(GUILD_ID))
+                self.tree.clear_commands(guild=guild)
+                self.tree.add_command(set_leaderboard_visibility, guild=guild)
+                self.tree.add_command(my_transactions, guild=guild)
+                self.tree.add_command(my_wallets, guild=guild)
+                self.tree.add_command(verify_wallet_otp, guild=guild)
+                self.tree.add_command(verify_status, guild=guild)
+                self.tree.add_command(leaderboard_full, guild=guild)
+                await self.tree.sync(guild=guild)
+                log.info("Slash commands synced to guild %s", GUILD_ID)
         else:
-            self.tree.add_command(verify_wallet)
             self.tree.add_command(set_leaderboard_visibility)
-            self.tree.add_command(check_wallet)
             self.tree.add_command(my_transactions)
+            self.tree.add_command(my_wallets)
+            self.tree.add_command(verify_wallet_otp)
+            self.tree.add_command(verify_status)
+            self.tree.add_command(leaderboard_full)
             await self.tree.sync()
         self.update_leaderboard.start()
         self.watch_snapshot_changes.start()
@@ -619,7 +1306,7 @@ class LeaderboardBot(commands.Bot):
         if now_ts - self._last_refresh_ts < LEADERBOARD_REFRESH_COOLDOWN:
             return
         self._last_refresh_ts = now_ts
-        for leaderboard_type in ("holders", "donations"):
+        for leaderboard_type in ("donations", "recent"):
             channel_id, message_id, display_limit = _load_state(leaderboard_type)
             if not channel_id or not message_id:
                 continue
@@ -631,10 +1318,10 @@ class LeaderboardBot(commands.Bot):
             except discord.NotFound:
                 continue
             try:
-                if leaderboard_type == "holders":
-                    embed = _render_holders_embed(display_limit)
-                else:
+                if leaderboard_type == "donations":
                     embed = _render_donations_embed(display_limit)
+                else:
+                    embed = _render_recent_transactions_embed(20)
                 embed_dict = embed.to_dict()
                 embed_hash = hash(str(embed_dict))
                 if self._last_render_hash.get(leaderboard_type) == embed_hash:
@@ -664,7 +1351,30 @@ class LeaderboardBot(commands.Bot):
                 self._tracker_disabled_logged = True
             return
         try:
-            count = await self._tracker.run_once()
+            count, wallets, verified_ids = await self._tracker.run_once()
+            discord_ids = {did for w in wallets if (did := _discord_id_for_wallet(w))}
+            for did in discord_ids:
+                _recompute_summary_for_discord_id(did)
+            if verified_ids:
+                for did in set(verified_ids):
+                    try:
+                        user = await self.fetch_user(int(did))
+                        if user:
+                            dm_message = (
+                                "Your wallet verification transfer was received. "
+                                "Your wallet is now linked."
+                            )
+                            if not _is_leaderboard_visible(str(did)):
+                                dm_message += (
+                                    "\n\n"
+                                    "Reminder: you are not on the leaderboard yet. "
+                                    "Use /leaderboardvisibility if you want your name shown. "
+                                    "You can also remove yourself anytime to make your donations anonymous again. "
+                                    "This is voluntary and does not affect any perks."
+                                )
+                            await user.send(dm_message)
+                    except discord.HTTPException:
+                        log.warning("Failed to DM verification for discord id %s", did)
             log.info("Tracker tick complete. New transactions: %s", count)
         except Exception as exc:
             log.exception("Tracker tick failed: %s", exc)
@@ -692,40 +1402,6 @@ intents.message_content = True
 bot = LeaderboardBot(intents=intents)
 
 
-@app_commands.command(name="verify", description="Verify your wallet with the bot.")
-@app_commands.describe(wallet="Your wallet address")
-async def verify_wallet(
-    interaction: discord.Interaction,
-    wallet: str,
-):
-    wallet = wallet.strip()
-    exists, amount = _lookup_wallet(wallet)
-    if not exists:
-        return await interaction.response.send_message(
-            "Wallet not found in the snapshot database. "
-            "Make sure it currently holds FARTBOY and run `!snapshotholders`.",
-            ephemeral=True,
-        )
-    success = _update_wallet_verification(
-        wallet=wallet.strip(),
-        discord_id=str(interaction.user.id),
-        discord_name=str(interaction.user),
-        on_leaderboard=0,
-    )
-    if not success:
-        return await interaction.response.send_message(
-            "Verification failed. Try `!snapshotholders` and run /verify again.",
-            ephemeral=True,
-        )
-    await interaction.response.send_message(
-        f"Verified. Your wallet is now linked to your Discord user. "
-        f"Snapshot balance: {amount:,.4f} FARTBOY. "
-        f"Use /leaderboardvisibility later to show your name.",
-        ephemeral=True,
-    )
-    await bot._refresh_leaderboards()
-
-
 @app_commands.command(
     name="leaderboardvisibility",
     description="Update whether your verified wallet shows your name on leaderboards.",
@@ -742,35 +1418,27 @@ async def set_leaderboard_visibility(
     )
     if not success:
         return await interaction.response.send_message(
-            "No verified wallet found for your Discord user. Run /verify first.",
+            "No verified wallet found for your Discord user. Run /verifywallet first.",
             ephemeral=True,
         )
     await interaction.response.send_message(
         "Updated leaderboard visibility.",
         ephemeral=True,
     )
+    _set_summary_visibility(str(interaction.user.id), 1 if on_leaderboard else 0)
+    _recompute_summary_for_discord_id(str(interaction.user.id))
     await bot._refresh_leaderboards()
 
 
-@app_commands.command(
-    name="checkwallet",
-    description="Check if a wallet exists in the current snapshot and see its balance.",
-)
-@app_commands.describe(wallet="Wallet address to check")
-async def check_wallet(
-    interaction: discord.Interaction,
-    wallet: str,
-):
+@bot.command(name="checkwallet")
+@commands.has_permissions(manage_guild=True)
+async def checkwallet(ctx: commands.Context, wallet: str = ""):
+    if not wallet:
+        return await ctx.send("Usage: `!checkwallet WALLET_ADDRESS`")
     exists, amount = _lookup_wallet(wallet.strip())
     if not exists:
-        return await interaction.response.send_message(
-            "Wallet not found in the current snapshot.",
-            ephemeral=True,
-        )
-    await interaction.response.send_message(
-        f"Wallet found. Snapshot balance: {amount:,.4f} FARTBOY.",
-        ephemeral=True,
-    )
+        return await ctx.send("Wallet not found in the current snapshot.")
+    await ctx.send(f"Wallet found. Snapshot balance: {amount:,.4f} FARTBOY.")
 
 
 @app_commands.command(
@@ -779,42 +1447,270 @@ async def check_wallet(
 )
 async def my_transactions(interaction: discord.Interaction):
     wallets = _find_wallets_for_discord_id(str(interaction.user.id))
-    if not wallets:
-        return await interaction.response.send_message(
-            "No verified wallet found. Run /verify first.",
-            ephemeral=True,
+    rows = _fetch_transactions_for_wallets(wallets, TX_LOOKUP_LIMIT)
+    if not rows:
+        rows = _fetch_transactions_for_discord_id(
+            str(interaction.user.id), TX_LOOKUP_LIMIT
         )
-    wallet = wallets[0]
-    rows = _fetch_transactions_for_wallet(wallet, TX_LOOKUP_LIMIT)
     if not rows:
         return await interaction.response.send_message(
             "No transactions found for your wallet.",
             ephemeral=True,
         )
+    total_usd = 0.0
+    total_holdings = 0.0
+    try:
+        with _connect_db(SNAPSHOT_DB) as conn:
+            for wallet in wallets:
+                row = conn.execute(
+                    f"""
+                    SELECT amount_fartboy
+                    FROM {SNAPSHOT_TABLE}
+                    WHERE wallet_address = ?
+                    """,
+                    (wallet,),
+                ).fetchone()
+                if row:
+                    total_holdings += float(row[0] or 0)
+    except sqlite3.Error:
+        total_holdings = 0.0
     lines = []
     for row in rows[:50]:
         lines.append(
             f"{row['timestamp']} | {row['amount_ui']} {row['token']} | "
-            f"${row['value_usdc']:.6f} | {row['value_fartboy']:.8f} FB"
+            f"${row['value_usdc']:.6f}"
         )
+        total_usd += float(row["value_usdc"] or 0)
     body = "\n".join(lines)
+    total_pct = 0.0
+    if total_holdings > 0:
+        total_pct = (total_usd / total_holdings) * 100.0
     await interaction.response.send_message(
-        f"Transactions for `{wallet}`:\n```\n{body}\n```",
+        f"Transactions from your linked wallet(s):\n```\n{body}\n```\n"
+        f"Total donated: ${total_usd:,.6f} ({total_pct:.4f}% of holdings)",
         ephemeral=True,
     )
 
 
-@bot.command(name="setholderleaderboard")
-@commands.has_permissions(manage_guild=True)
-async def setleaderboard(
-    ctx: commands.Context, channel: discord.TextChannel | None = None, limit: int = DEFAULT_LIMIT
-):
-    if channel is None:
-        return await ctx.send("Usage: `!setholderleaderboard #channel`")
-    limit = max(1, min(limit, 100))
-    msg = await channel.send(embed=_render_holders_embed(limit))
-    _save_state("holders", channel.id, msg.id, limit)
-    await ctx.send(f"Holder leaderboard message set in {channel.mention}.")
+@app_commands.command(
+    name="mywallets",
+    description="Show your verified wallets and total donated USD for each wallet.",
+)
+async def my_wallets(interaction: discord.Interaction):
+    wallets = _find_wallets_for_discord_id(str(interaction.user.id))
+    if not wallets:
+        return await interaction.response.send_message(
+            "No verified wallet found. Run /verifywallet first.",
+            ephemeral=True,
+        )
+    lines = []
+    total_usd = 0.0
+    total_holdings = 0.0
+    for wallet in wallets:
+        try:
+            with _connect_db(SNAPSHOT_DB) as conn:
+                row = conn.execute(
+                    f"""
+                    SELECT donated_usd, amount_fartboy
+                    FROM {SNAPSHOT_TABLE}
+                    WHERE wallet_address = ?
+                    """,
+                    (wallet,),
+                ).fetchone()
+            donated_usd = float(row[0] or 0) if row else 0.0
+            holdings = float(row[1] or 0) if row else 0.0
+        except sqlite3.Error:
+            donated_usd = 0.0
+            holdings = 0.0
+        total_usd += donated_usd
+        total_holdings += holdings
+
+        pct = 0.0
+        if holdings > 0:
+            pct = (donated_usd / holdings) * 100.0
+        lines.append(f"{wallet} | ${donated_usd:,.6f} | {pct:.4f}%")
+
+    total_pct = 0.0
+    if total_holdings > 0:
+        total_pct = (total_usd / total_holdings) * 100.0
+    lines.append(f"Total | ${total_usd:,.6f} | {total_pct:.4f}%")
+    body = "\n".join(lines)
+    await interaction.response.send_message(
+        f"Your verified wallets and donations:\n```\n{body}\n```",
+        ephemeral=True,
+    )
+
+
+@app_commands.command(
+    name="verifywallet",
+    description="Generate a unique small-amount OTP for wallet verification.",
+)
+async def verify_wallet_otp(interaction: discord.Interaction):
+    otp = _allocate_otp(str(interaction.user.id), str(interaction.user))
+    if not otp:
+        return await interaction.response.send_message(
+            "Failed to allocate a verification amount. Please try again later.",
+            ephemeral=True,
+        )
+    otp_value, tick = otp
+    war_chest = os.getenv("WARCHEST_ADDRESS", "")
+    show_reminder = not _is_leaderboard_visible(str(interaction.user.id))
+    assigned_at = None
+    try:
+        with _connect_db(SNAPSHOT_DB) as conn:
+            row = conn.execute(
+                f"""
+                SELECT assigned_at
+                FROM {OTP_TABLE}
+                WHERE assigned_to_discord_id = ?
+                  AND otp_value = ?
+                  AND tick_size = ?
+                  AND status = 'assigned'
+                """,
+                (str(interaction.user.id), otp_value, tick),
+            ).fetchone()
+            assigned_at = row[0] if row else None
+    except sqlite3.Error:
+        assigned_at = None
+    remaining = _format_remaining(assigned_at)
+    instructions = (
+        "To verify your wallet, send the exact amount of FARTBOY given below to the war chest. "
+        "This amount acts as a One-Time-Password (OTP), and will expire after 60 minutes. "
+        "You can always run /verifywallet again after that to get a new OTP.\n\n"
+        "Your verification should be done within a minute after the OTP amount of FARTBOY has been sent. "
+        "You can check the status and trigger immediate verification by running /verifystatus.\n\n"
+        "After the verification is complete, you will receive a DM confirming that your wallet is verified. "
+        "If you turned DMs off, you can only check the status with /verifystatus."
+    )
+    if show_reminder:
+        instructions += (
+            "\n\nAfter the verification is complete, you can run /leaderboardvisibility to put your username with the "
+            "amount you donated on the leaderboard, but this is up to you. Leaderboard visibility won't affect any of "
+            "your perks, and you can remove yourself any time to make your donations anonymous again."
+        )
+    await interaction.response.send_message(instructions, ephemeral=True)
+    await interaction.followup.send("War chest address:", ephemeral=True)
+    await interaction.followup.send(f"{war_chest}", ephemeral=True)
+    await interaction.followup.send("Amount:", ephemeral=True)
+    await interaction.followup.send(f"{otp_value}", ephemeral=True)
+
+
+@app_commands.command(
+    name="verifystatus",
+    description="Show your verification status (pending, used, expired).",
+)
+async def verify_status(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    if bot._tracker:
+        try:
+            count, wallets, verified_ids = await bot._tracker.run_once()
+            discord_ids = {
+                did for w in wallets if (did := _discord_id_for_wallet(w))
+            }
+            for did in discord_ids:
+                _recompute_summary_for_discord_id(did)
+            if verified_ids:
+                for did in set(verified_ids):
+                    try:
+                        user = await bot.fetch_user(int(did))
+                        if user:
+                            dm_message = (
+                                "Your wallet verification transfer was received. "
+                                "Your wallet is now linked."
+                            )
+                            if not _is_leaderboard_visible(str(did)):
+                                dm_message += (
+                                    "\n\n"
+                                    "Reminder: you are not on the leaderboard yet. "
+                                    "Use /leaderboardvisibility if you want your name shown. "
+                                    "You can also remove yourself anytime to make your donations anonymous again. "
+                                    "This is voluntary and does not affect any perks."
+                                )
+                            await user.send(dm_message)
+                    except discord.HTTPException:
+                        log.warning(
+                            "Failed to DM verification for discord id %s", did
+                        )
+            if count:
+                log.info("On-demand tracker run found %s new transactions.", count)
+        except Exception as exc:
+            log.warning("On-demand tracker run failed: %s", exc)
+    try:
+        with _connect_db(SNAPSHOT_DB) as conn:
+            _ensure_otp_registry(conn)
+            _expire_otps(conn)
+            pending = conn.execute(
+                f"""
+                SELECT otp_value, tick_size, assigned_at
+                FROM {OTP_TABLE}
+                WHERE assigned_to_discord_id = ?
+                  AND status = 'assigned'
+                ORDER BY assigned_at DESC
+                LIMIT 1
+                """,
+                (str(interaction.user.id),),
+            ).fetchone()
+            rows = conn.execute(
+                f"""
+                SELECT otp_value, tick_size, status, assigned_at, used_at, tx_signature
+                FROM {OTP_TABLE}
+                WHERE assigned_to_discord_id = ?
+                ORDER BY assigned_at DESC
+                """,
+                (str(interaction.user.id),),
+            ).fetchall()
+    except sqlite3.Error:
+        rows = []
+
+    if not rows:
+        message = "No verification records found. Use /verifywallet to start."
+        if not _is_leaderboard_visible(str(interaction.user.id)):
+            message += "\n\n" + _reminder_text()
+        return await interaction.followup.send(message, ephemeral=True)
+
+    war_chest = os.getenv("WARCHEST_ADDRESS", "")
+    lines = []
+    if pending:
+        otp_value, tick_size, assigned_at = pending
+        remaining = _format_remaining(assigned_at)
+        await interaction.followup.send(
+            "Your active verification amount:\n"
+            f"```\n{otp_value}\n```\n"
+            "Send to:\n"
+            f"```\n{war_chest}\n```\n"
+            f"Expires in {remaining} (tick size {tick_size} decimals).",
+            ephemeral=True,
+        )
+
+    for otp_value, tick_size, status, assigned_at, used_at, tx_signature in rows:
+        status_text = status or "unknown"
+        ts = _discord_time_from_sqlite(used_at or assigned_at)
+        sig = f"tx {tx_signature[:12]}…" if tx_signature else "tx none"
+        lines.append(
+            f"- {otp_value} ({tick_size} decimals) | {status_text} | {ts} | {sig}"
+        )
+
+    body = "\n".join(lines[:50])
+    await interaction.followup.send(
+        f"Your verification history:\n{body}",
+        ephemeral=True,
+    )
+    if not _is_leaderboard_visible(str(interaction.user.id)):
+        await interaction.followup.send(_reminder_text(), ephemeral=True)
+
+
+@app_commands.command(
+    name="leaderboard",
+    description="Show the full donation leaderboard (ephemeral pagination).",
+)
+async def leaderboard_full(interaction: discord.Interaction):
+    donors = _fetch_donors(limit=None)
+    view = DonationLeaderboardPager(interaction.user.id, donors)
+    await interaction.response.send_message(
+        view._render_page(),
+        ephemeral=True,
+        view=view,
+    )
 
 
 @bot.command(name="setdonationleaderboard")
@@ -829,14 +1725,19 @@ async def setdonationleaderboard(
     msg = await channel.send(embed=_render_donations_embed(limit))
     _save_state("donations", channel.id, msg.id, limit)
     await ctx.send(f"Donation leaderboard message set in {channel.mention}.")
-
-
-@bot.command(name="setholderleadersize")
-@commands.has_permissions(manage_guild=True)
-async def setholderleadersize(ctx: commands.Context, limit: int = DEFAULT_LIMIT):
-    limit = max(1, min(limit, 100))
-    _set_limit("holders", limit)
-    await ctx.send(f"Holder leaderboard size set to {limit}.")
+    recent_msg = await channel.send(embed=_render_recent_transactions_embed(20))
+    _save_state("recent", channel.id, recent_msg.id, 20)
+    war_chest = os.getenv("WARCHEST_ADDRESS", "")
+    await channel.send(
+        "Send FARTBOY, SOL or USDC to the following address to donate:"
+    )
+    await channel.send(war_chest)
+    info = (
+        "Wallets can be verified at any time, even after donations. "
+        "Donations sent from exchanges are not eligible for perks or leaderboard visibility. "
+        "Choosing to appear on the leaderboard is optional and does not affect perks."
+    )
+    await channel.send(info, view=VerificationButtonsView())
 
 
 @bot.command(name="setdonationleadersize")
@@ -856,28 +1757,27 @@ async def donationbothelp(ctx: commands.Context):
     )
     embed.add_field(
         name="Set Leaderboards",
-        value=(
-            "`!setholderleaderboard #channel [limit]`\n"
-            "`!setdonationleaderboard #channel [limit]`"
-        ),
+        value="`!setdonationleaderboard #channel [limit]`",
         inline=False,
     )
     embed.add_field(
         name="Set Sizes",
-        value=(
-            "`!setholderleadersize [limit]`\n"
-            "`!setdonationleadersize [limit]`"
-        ),
+        value="`!setdonationleadersize [limit]`",
         inline=False,
     )
     embed.add_field(
         name="Snapshots",
-        value="`!snapshotholders`\n`!resetverification`",
+        value="`!snapshotholders`\n`!resetverification`\n`!setexchangewallets`\n`!removeexchangewallets`",
         inline=False,
     )
     embed.add_field(
         name="Transactions",
         value="`!tx @user` or `!tx WALLET_ADDRESS`\n`!addtransaction SIGNATURE`",
+        inline=False,
+    )
+    embed.add_field(
+        name="Verification",
+        value="`/verifywallet`\n`/verifystatus`\n`/leaderboard`",
         inline=False,
     )
     embed.add_field(
@@ -932,12 +1832,179 @@ async def resetverification(ctx: commands.Context):
                     on_leaderboard = 0
                 """
             )
+            conn.execute(f"DELETE FROM {SUMMARY_TABLE}")
+            conn.execute(f"DELETE FROM {OTP_TABLE}")
             conn.commit()
         await ctx.send("Verification data reset.")
         await bot._refresh_leaderboards()
     except sqlite3.Error as exc:
         log.exception("Failed to reset verification: %s", exc)
         await ctx.send("Failed to reset verification. Check logs.")
+
+
+@bot.command(name="setexchangewallets")
+@commands.has_permissions(manage_guild=True)
+async def setexchangewallets(ctx: commands.Context, exchange_name: str = "", *wallets: str):
+    if not exchange_name or not wallets:
+        return await ctx.send(
+            "Usage: `!setexchangewallets EXCHANGE_NAME WALLET1 WALLET2 ...`"
+        )
+    cleaned = [w.strip() for w in wallets if w.strip()]
+    if not cleaned:
+        return await ctx.send("No valid wallet addresses provided.")
+    affected_discord_ids: Set[str] = set()
+    try:
+        with _connect_db(SNAPSHOT_DB) as conn:
+            _ensure_exchange_wallets_schema()
+            row = conn.execute(
+                "SELECT MAX(anonymous_id) FROM exchange_wallets"
+            ).fetchone()
+            next_id = int(row[0] or 0) + 1
+            for wallet in cleaned:
+                existing = conn.execute(
+                    "SELECT anonymous_id FROM exchange_wallets WHERE wallet_address = ?",
+                    (wallet,),
+                ).fetchone()
+                anon_id = existing[0] if existing and existing[0] else next_id
+                if not existing or not existing[0]:
+                    next_id += 1
+                conn.execute(
+                    """
+                    INSERT INTO exchange_wallets (wallet_address, exchange_name, added_at, anonymous_id)
+                    VALUES (?, ?, datetime('now'), ?)
+                    ON CONFLICT(wallet_address) DO UPDATE SET
+                        exchange_name = excluded.exchange_name,
+                        added_at = datetime('now'),
+                        anonymous_id = excluded.anonymous_id
+                    """,
+                    (wallet, exchange_name, anon_id),
+                )
+                row = conn.execute(
+                    f"SELECT discord_id FROM {SNAPSHOT_TABLE} WHERE wallet_address = ?",
+                    (wallet,),
+                ).fetchone()
+                if row and row[0]:
+                    affected_discord_ids.add(str(row[0]))
+                conn.execute(
+                    f"""
+                    UPDATE {SNAPSHOT_TABLE}
+                    SET discord_id = NULL,
+                        discord_name = NULL,
+                        on_leaderboard = 0
+                    WHERE wallet_address = ?
+                    """,
+                    (wallet,),
+                )
+            conn.commit()
+        with _connect_db(TX_DB) as tx_conn:
+            for wallet in cleaned:
+                tx_conn.execute(
+                    f"""
+                    UPDATE {TX_TABLE}
+                    SET discord_id = NULL
+                    WHERE sender_wallet = ?
+                    """,
+                    (wallet,),
+                )
+            tx_conn.commit()
+        for discord_id in affected_discord_ids:
+            with _connect_db(SNAPSHOT_DB) as conn:
+                remaining = conn.execute(
+                    f"""
+                    SELECT 1
+                    FROM {SNAPSHOT_TABLE}
+                    WHERE discord_id = ?
+                    LIMIT 1
+                    """,
+                    (discord_id,),
+                ).fetchone()
+                if not remaining:
+                    conn.execute(
+                        f"DELETE FROM {SUMMARY_TABLE} WHERE discord_id = ?",
+                        (discord_id,),
+                    )
+                    conn.commit()
+                    continue
+            _recompute_summary_for_discord_id(discord_id)
+        await ctx.send(
+            f"Recorded {len(cleaned)} exchange wallet(s) for `{exchange_name}`."
+        )
+        await bot._refresh_leaderboards()
+    except sqlite3.Error as exc:
+        log.exception("Failed to set exchange wallets: %s", exc)
+        await ctx.send("Failed to store exchange wallets. Check logs.")
+
+
+@bot.command(name="removeexchangewallets")
+@commands.has_permissions(manage_guild=True)
+async def removeexchangewallets(ctx: commands.Context, *wallets: str):
+    if not wallets:
+        return await ctx.send("Usage: `!removeexchangewallets WALLET1 WALLET2 ...`")
+    cleaned = [w.strip() for w in wallets if w.strip()]
+    if not cleaned:
+        return await ctx.send("No valid wallet addresses provided.")
+    try:
+        with _connect_db(SNAPSHOT_DB) as conn:
+            _ensure_exchange_wallets_schema()
+            for wallet in cleaned:
+                conn.execute(
+                    "DELETE FROM exchange_wallets WHERE wallet_address = ?",
+                    (wallet,),
+                )
+            conn.commit()
+        await ctx.send(f"Removed {len(cleaned)} exchange wallet(s).")
+        await bot._refresh_leaderboards()
+    except sqlite3.Error as exc:
+        log.exception("Failed to remove exchange wallets: %s", exc)
+        await ctx.send("Failed to remove exchange wallets. Check logs.")
+
+
+@bot.command(name="synccommands")
+@commands.has_permissions(manage_guild=True)
+async def synccommands(ctx: commands.Context):
+    try:
+        if ENABLE_DM_COMMANDS:
+            if GUILD_ID:
+                guild = discord.Object(id=int(GUILD_ID))
+                bot.tree.clear_commands(guild=guild)
+                await bot.tree.sync(guild=guild)
+            bot.tree.clear_commands(guild=None)
+            bot.tree.add_command(set_leaderboard_visibility)
+            bot.tree.add_command(my_transactions)
+            bot.tree.add_command(my_wallets)
+            bot.tree.add_command(verify_wallet_otp)
+            bot.tree.add_command(verify_status)
+            bot.tree.add_command(leaderboard_full)
+            await bot.tree.sync()
+            await ctx.send("Synced global slash commands (DMs enabled).")
+        else:
+            if GUILD_ID:
+                guild = discord.Object(id=int(GUILD_ID))
+                await bot.tree.sync(guild=guild)
+                await ctx.send("Synced guild slash commands.")
+            else:
+                await ctx.send("DISCORD_GUILD_ID is not set; skipping guild sync.")
+    except discord.DiscordException as exc:
+        log.exception("Failed to sync commands: %s", exc)
+        await ctx.send("Failed to sync slash commands. Check logs.")
+
+
+@bot.command(name="listcommands")
+@commands.has_permissions(manage_guild=True)
+async def listcommands(ctx: commands.Context):
+    try:
+        global_cmds = await bot.tree.fetch_commands()
+        global_names = ", ".join(sorted(cmd.name for cmd in global_cmds)) or "none"
+        msg = f"Global commands: {len(global_cmds)}\n{global_names}"
+        if GUILD_ID:
+            guild = discord.Object(id=int(GUILD_ID))
+            guild_cmds = await bot.tree.fetch_commands(guild=guild)
+            guild_names = ", ".join(sorted(cmd.name for cmd in guild_cmds)) or "none"
+            msg += f"\n\nGuild commands: {len(guild_cmds)}\n{guild_names}"
+        await ctx.send(f"```\n{msg}\n```")
+    except discord.DiscordException as exc:
+        log.exception("Failed to list commands: %s", exc)
+        await ctx.send("Failed to list commands. Check logs.")
 
 
 @bot.command(name="tx")
@@ -977,9 +2044,10 @@ async def tx_lookup(ctx: commands.Context, target: str = ""):
 @commands.has_permissions(manage_guild=True)
 async def addtransaction(ctx: commands.Context, signature: str = ""):
     if not signature:
-        return await ctx.send("Usage: `!addtransaction SIGNATURE`")
+        return await ctx.send("Usage: `!addtransaction SIGNATURE [@user]`")
+    discord_id = str(ctx.message.mentions[0].id) if ctx.message.mentions else None
     await ctx.send("Processing transaction...")
-    total, inserted = await _process_signature(signature.strip())
+    total, inserted = await _process_signature(signature.strip(), discord_id=discord_id)
     if total == 0:
         return await ctx.send("No incoming transfers for the war chest found in that signature.")
     if inserted == 0:
@@ -987,9 +2055,7 @@ async def addtransaction(ctx: commands.Context, signature: str = ""):
     await ctx.send(f"Recorded {inserted} incoming transfer(s) from that signature.")
 
 
-@setleaderboard.error
 @setdonationleaderboard.error
-@setholderleadersize.error
 @setdonationleadersize.error
 async def setleaderboard_error(ctx: commands.Context, error: Exception):
     if isinstance(error, commands.MissingPermissions):

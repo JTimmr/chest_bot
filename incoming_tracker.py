@@ -12,19 +12,23 @@ import json
 import os
 import sqlite3
 import time
+from decimal import Decimal, ROUND_DOWN
 from datetime import datetime, timezone
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple, Set
 
 import aiohttp
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
 MAX_RETRIES = 6
 RETRY_DELAY_BASE = 1.0
 USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 SOL_MINT = "So11111111111111111111111111111111111111112"
 SOL_DECIMALS = 9
+OTP_TABLE = os.getenv("OTP_TABLE", "otp_registry")
+OTP_EXPIRY_SECONDS = int(os.getenv("OTP_EXPIRY_SECONDS", "3600"))
+SUMMARY_TABLE = os.getenv("SUMMARY_TABLE", "verified_users")
 
 
 class RateLimiter:
@@ -118,6 +122,11 @@ class HeliusRPCClient:
         ]
         res = await self._make_request("getTokenAccountsByOwner", params)
         return res.get("value", []) if res else []
+
+    async def get_token_supply(self, mint: str) -> Optional[Dict]:
+        params = [mint, {"commitment": "finalized"}]
+        res = await self._make_request("getTokenSupply", params)
+        return res.get("value") if res else None
 
 
 def _account_keys(tx: Dict) -> List[str]:
@@ -234,6 +243,25 @@ def _to_iso(block_time: Optional[int]) -> Optional[str]:
     return datetime.fromtimestamp(block_time, tz=timezone.utc).isoformat()
 
 
+def _to_ts_seconds(value: Optional[object]) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            normalized = value.replace("Z", "+00:00")
+            dt = datetime.fromisoformat(normalized)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return int(dt.timestamp())
+        except ValueError:
+            return None
+    return None
+
+
 async def track_incoming_multi(
     target_wallet: str,
     api_key: str,
@@ -323,7 +351,7 @@ async def track_incoming_multi(
                 if not destination_owner or not source_owner:
                     continue
 
-                if destination_owner != target_wallet:
+                if destination_owner != target_wallet and destination != target_wallet:
                     continue
 
                 if mint not in allowed_spl_mints:
@@ -335,6 +363,7 @@ async def track_incoming_multi(
                         "timestamp": _to_iso(tx.get("blockTime")),
                         "amount_raw": amount_raw,
                         "amount_ui": _ui_amount(amount_raw, decimals),
+                        "decimals": decimals,
                         "token": "FARTBOY" if mint == fartboy_mint else "USDC",
                         "sender_wallet": source_owner,
                     }
@@ -364,7 +393,8 @@ def _init_transactions_db(conn: sqlite3.Connection, table: str) -> None:
             amount_raw INTEGER NOT NULL,
             amount_ui REAL NOT NULL,
             value_usdc REAL NOT NULL,
-            value_fartboy REAL NOT NULL
+            value_fartboy REAL NOT NULL,
+            discord_id TEXT
         )
         """
     )
@@ -374,6 +404,9 @@ def _init_transactions_db(conn: sqlite3.Connection, table: str) -> None:
         ON {table} (signature, sender_wallet, token, amount_raw)
         """
     )
+    existing_cols = {row[1] for row in cur.execute(f"PRAGMA table_info({table})")}
+    if "discord_id" not in existing_cols:
+        cur.execute(f"ALTER TABLE {table} ADD COLUMN discord_id TEXT")
     conn.commit()
 
 
@@ -403,6 +436,176 @@ def _init_snapshot_db(conn: sqlite3.Connection, table: str) -> None:
         cur.execute(f"ALTER TABLE {table} ADD COLUMN discord_name TEXT")
     if "on_leaderboard" not in existing_cols:
         cur.execute(f"ALTER TABLE {table} ADD COLUMN on_leaderboard INTEGER NOT NULL DEFAULT 0")
+    conn.commit()
+
+
+def _ensure_otp_registry(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {OTP_TABLE} (
+            otp_value TEXT NOT NULL,
+            tick_size INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            assigned_to_discord_id TEXT,
+            assigned_to_name TEXT,
+            assigned_at TEXT,
+            used_at TEXT,
+            tx_signature TEXT,
+            sender_wallet TEXT,
+            PRIMARY KEY (otp_value, tick_size)
+        )
+        """
+    )
+    existing_cols = {row[1] for row in conn.execute(f"PRAGMA table_info({OTP_TABLE})")}
+    if "sender_wallet" not in existing_cols:
+        conn.execute(f"ALTER TABLE {OTP_TABLE} ADD COLUMN sender_wallet TEXT")
+    conn.commit()
+
+
+
+
+def _expire_otps(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        f"""
+        UPDATE {OTP_TABLE}
+        SET status = 'expired'
+        WHERE status = 'assigned'
+          AND assigned_at IS NOT NULL
+          AND assigned_at <= datetime('now', '-{OTP_EXPIRY_SECONDS} seconds')
+        """
+    )
+    conn.commit()
+
+
+def _format_otp_if_exact(amount_raw: int, decimals: int, tick: int) -> Optional[str]:
+    amount = Decimal(amount_raw) / (Decimal(10) ** decimals)
+    quantum = Decimal("1").scaleb(-tick)
+    quantized = amount.quantize(quantum, rounding=ROUND_DOWN)
+    if quantized != amount:
+        return None
+    return f"{quantized:.{tick}f}"
+
+
+def _record_used_otp(
+    conn: sqlite3.Connection,
+    otp_value: str,
+    tick_size: int,
+    signature: str,
+    sender_wallet: str,
+) -> None:
+    conn.execute(
+        f"""
+        INSERT INTO {OTP_TABLE} (
+            otp_value, tick_size, status, used_at, tx_signature, sender_wallet
+        )
+        VALUES (?, ?, 'used', datetime('now'), ?, ?)
+        ON CONFLICT(otp_value, tick_size) DO UPDATE SET
+            status = 'used',
+            used_at = datetime('now'),
+            tx_signature = excluded.tx_signature,
+            sender_wallet = excluded.sender_wallet
+        """,
+        (otp_value, tick_size, signature, sender_wallet),
+    )
+    conn.commit()
+
+
+def _load_exchange_wallets(conn: sqlite3.Connection) -> Set[str]:
+    try:
+        table = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='exchange_wallets'"
+        ).fetchone()
+        if not table:
+            return set()
+        rows = conn.execute(
+            "SELECT wallet_address FROM exchange_wallets"
+        ).fetchall()
+        return {row[0] for row in rows if row and row[0]}
+    except sqlite3.Error:
+        return set()
+
+
+def _match_assigned_otp(
+    conn: sqlite3.Connection,
+    otp_value: str,
+    tick_size: int,
+    signature: str,
+    sender_wallet: str,
+) -> Optional[Tuple[str, str]]:
+    row = conn.execute(
+        f"""
+        SELECT assigned_to_discord_id, assigned_to_name
+        FROM {OTP_TABLE}
+        WHERE otp_value = ? AND tick_size = ? AND status = 'assigned'
+        """,
+        (otp_value, tick_size),
+    ).fetchone()
+    if not row:
+        return None
+    conn.execute(
+        f"""
+        UPDATE {OTP_TABLE}
+        SET status = 'used',
+            used_at = datetime('now'),
+            tx_signature = ?,
+            sender_wallet = ?
+        WHERE otp_value = ? AND tick_size = ?
+        """,
+        (signature, sender_wallet, otp_value, tick_size),
+    )
+    conn.commit()
+    return row[0], row[1] or ""
+
+
+def _recompute_summary_for_discord_id(conn: sqlite3.Connection, discord_id: str) -> None:
+    wallets = conn.execute(
+        """
+        SELECT wallet_address, amount_fartboy, donated_usd, discord_name
+        FROM fartboy_holders
+        WHERE discord_id = ?
+        """,
+        (discord_id,),
+    ).fetchall()
+    if not wallets:
+        return
+    total_holdings = sum(float(r[1] or 0) for r in wallets)
+    total_donated_usd = sum(float(r[2] or 0) for r in wallets)
+    discord_name = next((r[3] for r in wallets if r[3]), None)
+    wallet_list = ",".join(sorted({r[0] for r in wallets if r[0]}))
+    existing = conn.execute(
+        f"""
+        SELECT leaderboard_visible, roles
+        FROM {SUMMARY_TABLE}
+        WHERE discord_id = ?
+        """,
+        (discord_id,),
+    ).fetchone()
+    leaderboard_visible = int(existing[0]) if existing else 0
+    roles = existing[1] if existing else None
+    conn.execute(
+        f"""
+        INSERT INTO {SUMMARY_TABLE} (
+            discord_id, discord_name, wallets, total_holdings,
+            total_donated_usd, leaderboard_visible, roles, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
+        ON CONFLICT(discord_id) DO UPDATE SET
+            discord_name = excluded.discord_name,
+            wallets = excluded.wallets,
+            total_holdings = excluded.total_holdings,
+            total_donated_usd = excluded.total_donated_usd,
+            updated_at = datetime('now')
+        """,
+        (
+            discord_id,
+            discord_name,
+            wallet_list,
+            total_holdings,
+            total_donated_usd,
+            leaderboard_visible,
+            roles,
+        ),
+    )
     conn.commit()
 
 
@@ -473,8 +676,9 @@ class IncomingTracker:
         snapshot_table: str = "fartboy_holders",
         checkpoint_file: str = "data/incoming_checkpoint.txt",
         delay: float = 0.1,
-        max_pages: int = 1,
-        page_limit: int = 200,
+        max_pages: int = 3,
+        page_limit: int = 10,
+        account_refresh_seconds: int = 0,
     ) -> None:
         self.api_key = api_key
         self.target_wallet = target_wallet
@@ -487,9 +691,17 @@ class IncomingTracker:
         self.delay = max(0.05, delay)
         self.max_pages = max_pages
         self.page_limit = min(max(page_limit, 1), 1000)
+        self.account_refresh_seconds = max(30, account_refresh_seconds)
+        self._last_accounts_refresh = 0.0
+        self._cached_addresses: List[str] = []
 
-    async def run_once(self) -> int:
-        checkpoint_map = _load_checkpoint_map(self.checkpoint_file)
+    async def _get_tracked_addresses(self) -> List[str]:
+        now = time.time()
+        if self._cached_addresses and (
+            self.account_refresh_seconds <= 0
+            or (now - self._last_accounts_refresh) < self.account_refresh_seconds
+        ):
+            return list(self._cached_addresses)
         addresses = [self.target_wallet]
         async with HeliusRPCClient(self.api_key, request_delay=self.delay) as client:
             fartboy_accounts = await client.get_token_accounts_by_owner(
@@ -502,6 +714,13 @@ class IncomingTracker:
             pubkey = acc.get("pubkey")
             if pubkey:
                 addresses.append(pubkey)
+        self._cached_addresses = addresses
+        self._last_accounts_refresh = now
+        return list(addresses)
+
+    async def run_once(self) -> Tuple[int, List[str], List[str]]:
+        checkpoint_map = _load_checkpoint_map(self.checkpoint_file)
+        addresses = await self._get_tracked_addresses()
 
         rows, new_checkpoint_map = await track_incoming_multi(
             target_wallet=self.target_wallet,
@@ -518,10 +737,10 @@ class IncomingTracker:
             checkpoint_map = new_checkpoint_map
         if not checkpoint_map and not rows:
             print("Checkpoint initialized; no historical transactions processed.")
-            return 0
+            return 0, [], []
         if not rows:
             print("No new incoming transactions.")
-            return 0
+            return 0, [], []
 
         _print_results(rows)
         print(f"Found {len(rows)} incoming transactions.")
@@ -537,11 +756,17 @@ class IncomingTracker:
         try:
             _init_transactions_db(tx_conn, self.tx_table)
             _init_snapshot_db(snapshot_conn, self.snapshot_table)
+            _ensure_otp_registry(snapshot_conn)
+            _expire_otps(snapshot_conn)
+            exchange_wallets = _load_exchange_wallets(snapshot_conn)
 
             computed = await _compute_values_for_rows(rows, self.fartboy_mint)
             if not computed:
                 print("Price lookup failed; skipping donation updates this cycle.")
-                return len(rows)
+                return len(rows), [], []
+
+            sender_wallets: List[str] = []
+            verified_discord_ids: List[str] = []
             for row, value_usdc, value_fartboy in computed:
                 cur = tx_conn.cursor()
                 cur.execute(
@@ -565,6 +790,7 @@ class IncomingTracker:
                 )
                 tx_conn.commit()
                 if cur.rowcount == 1:
+                    sender_wallets.append(row["sender_wallet"])
                     _apply_donations(
                         snapshot_conn,
                         self.snapshot_table,
@@ -572,10 +798,48 @@ class IncomingTracker:
                         value_fartboy,
                         value_usdc,
                     )
+                    if row.get("token") == "FARTBOY" and row.get("amount_ui", 0) < 1:
+                        if row.get("sender_wallet") in exchange_wallets:
+                            continue
+                        decimals = int(row.get("decimals", 0))
+                        amount_raw = int(row.get("amount_raw", 0))
+                        for tick in (5, 6):
+                            otp_value = _format_otp_if_exact(amount_raw, decimals, tick)
+                            if not otp_value:
+                                continue
+                            matched = _match_assigned_otp(
+                                snapshot_conn,
+                                otp_value,
+                                tick,
+                                row["signature"],
+                                row["sender_wallet"],
+                            )
+                            if matched:
+                                discord_id, discord_name = matched
+                                verified_discord_ids.append(discord_id)
+                                snapshot_conn.execute(
+                                    f"""
+                                    UPDATE {self.snapshot_table}
+                                    SET discord_id = ?, discord_name = ?, on_leaderboard = 0
+                                    WHERE wallet_address = ?
+                                      AND (discord_id IS NULL OR discord_id = ?)
+                                    """,
+                                    (discord_id, discord_name, row["sender_wallet"], discord_id),
+                                )
+                                snapshot_conn.commit()
+                                _recompute_summary_for_discord_id(snapshot_conn, discord_id)
+                            else:
+                                _record_used_otp(
+                                    snapshot_conn,
+                                    otp_value,
+                                    tick,
+                                    row["signature"],
+                                    row["sender_wallet"],
+                                )
         finally:
             tx_conn.close()
             snapshot_conn.close()
-        return len(rows)
+        return len(rows), sender_wallets, verified_discord_ids
 
 
 async def _fetch_jupiter_price_usdc(session: aiohttp.ClientSession, mint: str) -> float:
@@ -647,7 +911,11 @@ async def _compute_values_for_rows(rows: List[Dict], fartboy_mint: str) -> List[
         price_cache: Dict[str, float] = {}
         range_cache: Dict[str, List[List[float]]] = {}
 
-        timestamps = [row.get("timestamp") for row in rows if isinstance(row.get("timestamp"), int)]
+        timestamps = [
+            ts
+            for ts in (_to_ts_seconds(row.get("timestamp")) for row in rows)
+            if ts is not None
+        ]
         range_start = min(timestamps) - 600 if timestamps else None
         range_end = max(timestamps) + 600 if timestamps else None
 
@@ -679,7 +947,8 @@ async def _compute_values_for_rows(rows: List[Dict], fartboy_mint: str) -> List[
             price_cache[mint] = price
             return price
 
-        async def get_price_at(mint: str, ts_seconds: Optional[int]) -> float:
+        async def get_price_at(mint: str, ts_value: Optional[object]) -> float:
+            ts_seconds = _to_ts_seconds(ts_value)
             if ts_seconds is None:
                 return await get_price(mint)
             cache_key = f"{mint}:{ts_seconds // 60}"
@@ -725,7 +994,7 @@ def main() -> None:
     )
     parser.add_argument("--api-key", default=None, help="Helius API key (or HELIUS_API_KEY env var)")
     parser.add_argument("--max-pages", type=int, default=1, help="Max pages to scan (1000 sigs/page)")
-    parser.add_argument("--page-limit", type=int, default=200, help="Signatures per page (max 1000)")
+    parser.add_argument("--page-limit", type=int, default=10, help="Signatures per page (max 1000)")
     parser.add_argument("--delay", type=float, default=0.1, help="Delay between RPC requests (seconds)")
     parser.add_argument("--tx-db", default="data/incoming_transactions.db", help="Transactions SQLite DB")
     parser.add_argument("--tx-table", default="incoming_transactions", help="Transactions table")
