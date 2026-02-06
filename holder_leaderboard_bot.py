@@ -22,6 +22,7 @@ from incoming_tracker import (
     HeliusRPCClient,
     USDC_MINT,
     SOL_DECIMALS,
+    _init_transactions_db,
     _to_iso,
     _token_account_map,
     _iter_system_transfer_instructions,
@@ -67,6 +68,8 @@ _SNAPSHOT_COLUMNS: Set[str] | None = None
 def _connect_db(path: str) -> sqlite3.Connection:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     return sqlite3.connect(path)
+
+
 
 
 def _ensure_snapshot_schema() -> None:
@@ -473,8 +476,18 @@ def _fetch_top_donors(limit: int = DEFAULT_LIMIT) -> List[Tuple[str, float, str 
     return _fetch_donors(limit)
 
 
+def _ensure_tx_table() -> None:
+    try:
+        with sqlite3.connect(TX_DB) as conn:
+            _init_transactions_db(conn, TX_TABLE)
+            conn.commit()
+    except sqlite3.Error as exc:
+        log.error("Failed to ensure transactions table %s:%s - %s", TX_DB, TX_TABLE, exc)
+
+
 def _fetch_total_donations_usd() -> float:
     try:
+        _ensure_tx_table()
         with sqlite3.connect(TX_DB) as conn:
             row = conn.execute(
                 f"SELECT SUM(value_usdc) FROM {TX_TABLE}"
@@ -643,6 +656,7 @@ def _get_or_create_anonymous_id(discord_id: str) -> int:
 
 def _fetch_transactions_for_wallet(wallet: str, limit: int) -> List[dict]:
     try:
+        _ensure_tx_table()
         with sqlite3.connect(TX_DB) as conn:
             rows = conn.execute(
                 f"""
@@ -673,6 +687,7 @@ def _fetch_transactions_for_wallet(wallet: str, limit: int) -> List[dict]:
 
 def _fetch_transactions_for_discord_id(discord_id: str, limit: int) -> List[dict]:
     try:
+        _ensure_tx_table()
         with sqlite3.connect(TX_DB) as conn:
             rows = conn.execute(
                 f"""
@@ -1034,6 +1049,7 @@ def _render_recent_transactions_embed(limit: int = 20) -> discord.Embed:
         timestamp=datetime.now(timezone.utc),
     )
     try:
+        _ensure_tx_table()
         with sqlite3.connect(TX_DB) as conn:
             rows = conn.execute(
                 f"""

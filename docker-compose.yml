@@ -10,5 +10,8 @@ services:
     volumes:
       # Mount .env file if you want to update it without rebuilding
       - ./.env:/app/.env:ro
-      # Persist databases in a dedicated data folder
-      - ./data:/app/data
+      # Persist databases in a named volume (reset with `docker compose down -v`)
+      - chest_bot_data:/app/data
+
+volumes:
+  chest_bot_data:
