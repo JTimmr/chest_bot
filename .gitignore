@@ -1,5 +1,7 @@
 .env
 *.db
+data/
+incoming_checkpoint.txt
 __pycache__/
 .venv/
 .python-version
