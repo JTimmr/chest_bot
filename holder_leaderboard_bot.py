@@ -54,7 +54,7 @@ GUILD_ID = os.getenv("DISCORD_GUILD_ID")
 ENABLE_DM_COMMANDS = os.getenv("ENABLE_DM_COMMANDS", "").lower() in {"1", "true", "yes"}
 SNAPSHOT_WATCH_SECONDS = int(os.getenv("SNAPSHOT_WATCH_SECONDS", "10"))
 LEADERBOARD_REFRESH_COOLDOWN = int(os.getenv("LEADERBOARD_REFRESH_COOLDOWN_SECONDS", "10"))
-TRACKER_INTERVAL_SECONDS = int(os.getenv("TRACKER_INTERVAL_SECONDS", "30"))
+TRACKER_INTERVAL_SECONDS = int(os.getenv("TRACKER_INTERVAL_SECONDS", "120"))
 TX_DB = os.getenv("TX_DB", "/app/data/incoming_transactions.db")
 TX_TABLE = os.getenv("TX_TABLE", "incoming_transactions")
 TX_LOOKUP_LIMIT = int(os.getenv("TX_LOOKUP_LIMIT", "50"))
@@ -1593,7 +1593,7 @@ async def verify_wallet_otp(interaction: discord.Interaction):
         "To verify your wallet, send the exact amount of FARTBOY given below to the war chest. "
         "This amount acts as a One-Time-Password (OTP), and will expire after 60 minutes. "
         "You can always run /verifywallet again after that to get a new OTP.\n\n"
-        "Your verification should be done within a minute after the OTP amount of FARTBOY has been sent. "
+        "Your verification should be done within 3 minutes after the OTP amount of FARTBOY has been sent. "
         "You can check the status and trigger immediate verification by running /verifystatus.\n\n"
         "After the verification is complete, you will receive a DM confirming that your wallet is verified. "
         "If you turned DMs off, you can only check the status with /verifystatus."
