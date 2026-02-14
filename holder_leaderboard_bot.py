@@ -128,6 +128,53 @@ def _ensure_summary_schema() -> None:
         log.error("Failed to ensure summary schema: %s", exc)
 
 
+def _ensure_dm_state_schema() -> None:
+    try:
+        with _connect_db(SNAPSHOT_DB) as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS dm_state (
+                    discord_id TEXT PRIMARY KEY,
+                    intro_sent INTEGER NOT NULL DEFAULT 0,
+                    intro_sent_at TEXT
+                )
+                """
+            )
+            conn.commit()
+    except sqlite3.Error as exc:
+        log.error("Failed to ensure DM state schema: %s", exc)
+
+
+def _has_sent_intro_dm(discord_id: str) -> bool:
+    try:
+        with _connect_db(SNAPSHOT_DB) as conn:
+            row = conn.execute(
+                "SELECT intro_sent FROM dm_state WHERE discord_id = ?",
+                (discord_id,),
+            ).fetchone()
+        return bool(row and int(row[0] or 0) == 1)
+    except sqlite3.Error:
+        return False
+
+
+def _mark_intro_dm_sent(discord_id: str) -> None:
+    try:
+        with _connect_db(SNAPSHOT_DB) as conn:
+            conn.execute(
+                """
+                INSERT INTO dm_state (discord_id, intro_sent, intro_sent_at)
+                VALUES (?, 1, datetime('now'))
+                ON CONFLICT(discord_id) DO UPDATE SET
+                    intro_sent = 1,
+                    intro_sent_at = datetime('now')
+                """,
+                (discord_id,),
+            )
+            conn.commit()
+    except sqlite3.Error as exc:
+        log.error("Failed to mark intro DM sent: %s", exc)
+
+
 def _ensure_otp_schema() -> None:
     try:
         with _connect_db(SNAPSHOT_DB) as conn:
@@ -268,6 +315,52 @@ def _format_remaining(assigned_at: Optional[str]) -> str:
     minutes = remaining // 60
     seconds = remaining % 60
     return f"{minutes}m {seconds}s"
+
+
+async def _send_first_dm_extras(user: discord.User) -> None:
+    _ensure_dm_state_schema()
+    discord_id = str(user.id)
+    if _has_sent_intro_dm(discord_id):
+        return
+    war_chest = os.getenv("WARCHEST_ADDRESS", "").strip()
+    try:
+        await user.send("War chest address:")
+        await user.send(war_chest or "War chest address is not configured.")
+        await user.send("Quick commands:", view=VerificationButtonsView())
+        _mark_intro_dm_sent(discord_id)
+    except discord.HTTPException:
+        log.warning("Failed to send intro DM extras for discord id %s", discord_id)
+
+
+async def _send_dm_with_intro(user: discord.User, message: str) -> None:
+    await user.send(message)
+    await _send_first_dm_extras(user)
+
+
+def _welcome_message_text() -> str:
+    return (
+        "Welcome! This bot helps you verify your wallet and track donations.\n\n"
+        "Start with /verifywallet to get a small verification amount to send to the war chest. "
+        "After sending, use /verifystatus to check your verification.\n\n"
+        "Other helpful commands: /mywallets, /mytransactions, /leaderboard, "
+        "/leaderboardvisibility."
+    )
+
+
+async def _send_full_welcome_dm(user: discord.User) -> bool:
+    _ensure_dm_state_schema()
+    discord_id = str(user.id)
+    war_chest = os.getenv("WARCHEST_ADDRESS", "").strip()
+    try:
+        await user.send(_welcome_message_text())
+        await user.send("War chest address:")
+        await user.send(war_chest or "War chest address is not configured.")
+        await user.send("Quick commands:", view=VerificationButtonsView())
+        _mark_intro_dm_sent(discord_id)
+        return True
+    except discord.HTTPException:
+        log.warning("Failed to send full welcome DM for discord id %s", discord_id)
+        return False
 
 
 def _is_leaderboard_visible(discord_id: str) -> bool:
@@ -1003,6 +1096,70 @@ def _update_visibility_by_discord(
         return False
 
 
+def _clear_verification_for_wallets(wallets: List[str]) -> int:
+    if not wallets:
+        return 0
+    affected_discord_ids: Set[str] = set()
+    try:
+        with _connect_db(SNAPSHOT_DB) as conn:
+            for wallet in wallets:
+                row = conn.execute(
+                    f"""
+                    SELECT discord_id
+                    FROM {SNAPSHOT_TABLE}
+                    WHERE wallet_address = ?
+                    """,
+                    (wallet,),
+                ).fetchone()
+                if row and row[0]:
+                    affected_discord_ids.add(str(row[0]))
+                conn.execute(
+                    f"""
+                    UPDATE {SNAPSHOT_TABLE}
+                    SET discord_id = NULL,
+                        discord_name = NULL,
+                        on_leaderboard = 0
+                    WHERE wallet_address = ?
+                    """,
+                    (wallet,),
+                )
+            conn.commit()
+        with _connect_db(TX_DB) as tx_conn:
+            for wallet in wallets:
+                tx_conn.execute(
+                    f"""
+                    UPDATE {TX_TABLE}
+                    SET discord_id = NULL
+                    WHERE sender_wallet = ?
+                    """,
+                    (wallet,),
+                )
+            tx_conn.commit()
+        for discord_id in affected_discord_ids:
+            with _connect_db(SNAPSHOT_DB) as conn:
+                remaining = conn.execute(
+                    f"""
+                    SELECT 1
+                    FROM {SNAPSHOT_TABLE}
+                    WHERE discord_id = ?
+                    LIMIT 1
+                    """,
+                    (discord_id,),
+                ).fetchone()
+                if not remaining:
+                    conn.execute(
+                        f"DELETE FROM {SUMMARY_TABLE} WHERE discord_id = ?",
+                        (discord_id,),
+                    )
+                    conn.commit()
+                    continue
+            _recompute_summary_for_discord_id(discord_id)
+        return len(wallets)
+    except sqlite3.Error as exc:
+        log.error("Failed to clear verification wallets: %s", exc)
+        return 0
+
+
 def _render_donations_embed(limit: int) -> discord.Embed:
     donors = _fetch_top_donors(limit)
     total_donations = _fetch_total_donations_usd()
@@ -1235,10 +1392,31 @@ class VerificationButtonsView(discord.ui.View):
     ):
         await leaderboard_full.callback(interaction)
 
+    @discord.ui.button(
+        label="Open DM",
+        style=discord.ButtonStyle.secondary,
+        custom_id="open_dm_button",
+        row=3,
+    )
+    async def open_dm_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        success = await _send_full_welcome_dm(interaction.user)
+        if success:
+            await interaction.response.send_message(
+                "Check your DMs for the welcome info and buttons.",
+                ephemeral=True,
+            )
+        else:
+            await interaction.response.send_message(
+                "I couldn't DM you. Please enable DMs for this server and try again.",
+                ephemeral=True,
+            )
+
 
 class LeaderboardBot(commands.Bot):
     def __init__(self, **kwargs):
-        super().__init__(command_prefix="!", **kwargs)
+        super().__init__(command_prefix="!", help_command=None, **kwargs)
         _init_state_db()
         self._last_snapshot_mtime = 0.0
         self._last_refresh_ts = 0.0
@@ -1250,6 +1428,7 @@ class LeaderboardBot(commands.Bot):
         _ensure_snapshot_tables()
         _ensure_snapshot_schema()
         _ensure_summary_schema()
+        _ensure_dm_state_schema()
         _ensure_otp_schema()
         _ensure_exchange_wallets_schema()
         self.add_view(VerificationButtonsView())
@@ -1285,6 +1464,7 @@ class LeaderboardBot(commands.Bot):
                 self.tree.add_command(verify_wallet_otp)
                 self.tree.add_command(verify_status)
                 self.tree.add_command(leaderboard_full)
+                self.tree.add_command(dm_welcome)
                 await self.tree.sync()
                 log.info("Slash commands synced globally (DMs enabled).")
             else:
@@ -1299,6 +1479,7 @@ class LeaderboardBot(commands.Bot):
                 self.tree.add_command(verify_wallet_otp, guild=guild)
                 self.tree.add_command(verify_status, guild=guild)
                 self.tree.add_command(leaderboard_full, guild=guild)
+                self.tree.add_command(dm_welcome, guild=guild)
                 await self.tree.sync(guild=guild)
                 log.info("Slash commands synced to guild %s", GUILD_ID)
         else:
@@ -1308,6 +1489,7 @@ class LeaderboardBot(commands.Bot):
             self.tree.add_command(verify_wallet_otp)
             self.tree.add_command(verify_status)
             self.tree.add_command(leaderboard_full)
+            self.tree.add_command(dm_welcome)
             await self.tree.sync()
         self.update_leaderboard.start()
         self.watch_snapshot_changes.start()
@@ -1388,7 +1570,7 @@ class LeaderboardBot(commands.Bot):
                                     "You can also remove yourself anytime to make your donations anonymous again. "
                                     "This is voluntary and does not affect any perks."
                                 )
-                            await user.send(dm_message)
+                            await _send_dm_with_intro(user, dm_message)
                     except discord.HTTPException:
                         log.warning("Failed to DM verification for discord id %s", did)
             log.info("Tracker tick complete. New transactions: %s", count)
@@ -1642,7 +1824,7 @@ async def verify_status(interaction: discord.Interaction):
                                     "You can also remove yourself anytime to make your donations anonymous again. "
                                     "This is voluntary and does not affect any perks."
                                 )
-                            await user.send(dm_message)
+                            await _send_dm_with_intro(user, dm_message)
                     except discord.HTTPException:
                         log.warning(
                             "Failed to DM verification for discord id %s", did
@@ -1729,6 +1911,24 @@ async def leaderboard_full(interaction: discord.Interaction):
     )
 
 
+@app_commands.command(
+    name="dm",
+    description="Send the welcome info and buttons in a DM.",
+)
+async def dm_welcome(interaction: discord.Interaction):
+    success = await _send_full_welcome_dm(interaction.user)
+    if success:
+        await interaction.response.send_message(
+            "Check your DMs for the welcome info and buttons.",
+            ephemeral=True,
+        )
+    else:
+        await interaction.response.send_message(
+            "I couldn't DM you. Please enable DMs for this server and try again.",
+            ephemeral=True,
+        )
+
+
 @bot.command(name="setdonationleaderboard")
 @commands.has_permissions(manage_guild=True)
 async def setdonationleaderboard(
@@ -1764,44 +1964,116 @@ async def setdonationleadersize(ctx: commands.Context, limit: int = DEFAULT_LIMI
     await ctx.send(f"Donation leaderboard size set to {limit}.")
 
 
+_COMMAND_HELP: Dict[str, Dict[str, str]] = {
+    "help": {
+        "summary": "Show help for bot commands.",
+        "usage": "`!help [command]`",
+        "details": "Example: `!help tx`.",
+    },
+    "checkwallet": {
+        "summary": "Check a wallet against the snapshot balances.",
+        "usage": "`!checkwallet WALLET_ADDRESS`",
+        "details": "Returns the snapshot balance for the wallet if found.",
+    },
+    "setdonationleaderboard": {
+        "summary": "Post the donation and recent transaction leaderboards.",
+        "usage": "`!setdonationleaderboard #channel [limit]`",
+        "details": "Also posts the war chest address and command buttons.",
+    },
+    "setdonationleadersize": {
+        "summary": "Update the donation leaderboard size.",
+        "usage": "`!setdonationleadersize [limit]`",
+        "details": "Limit is clamped between 1 and 100.",
+    },
+    "snapshotholders": {
+        "summary": "Run the holder snapshot script.",
+        "usage": "`!snapshotholders`",
+        "details": "Takes a few minutes; check logs for errors.",
+    },
+    "resetverification": {
+        "summary": "Clear all verification data.",
+        "usage": "`!resetverification`",
+        "details": "Removes all linked wallets and OTPs.",
+    },
+    "setexchangewallets": {
+        "summary": "Mark wallets as exchange wallets.",
+        "usage": "`!setexchangewallets EXCHANGE_NAME WALLET1 WALLET2 ...`",
+        "details": "Exchange wallets are excluded from perks and verification.",
+    },
+    "removeexchangewallets": {
+        "summary": "Remove wallets from the exchange list.",
+        "usage": "`!removeexchangewallets WALLET1 WALLET2 ...`",
+        "details": "Does not restore any previous verification links.",
+    },
+    "manualverify": {
+        "summary": "Manually link a wallet to a Discord user.",
+        "usage": "`!manualverify @user WALLET_ADDRESS [on/off]`",
+        "details": "Optionally set leaderboard visibility with on/off.",
+    },
+    "removeverification": {
+        "summary": "Remove verification for a user or wallet.",
+        "usage": "`!removeverification WALLET_ADDRESS`",
+        "details": "Clears the linked wallet and removes donation links.",
+    },
+    "synccommands": {
+        "summary": "Sync slash commands.",
+        "usage": "`!synccommands`",
+        "details": "Useful after enabling DM commands or adding new ones.",
+    },
+    "listcommands": {
+        "summary": "List registered slash commands.",
+        "usage": "`!listcommands`",
+        "details": "Shows both global and guild commands when available.",
+    },
+    "tx": {
+        "summary": "List recent transactions for a user or wallet.",
+        "usage": "`!tx @user` or `!tx WALLET_ADDRESS`",
+        "details": "Shows up to the configured lookup limit.",
+    },
+    "addtransaction": {
+        "summary": "Manually record a transaction signature.",
+        "usage": "`!addtransaction SIGNATURE [@user]`",
+        "details": "Only records transfers into the war chest.",
+    },
+    "donationbothelp": {
+        "summary": "Legacy help command.",
+        "usage": "`!donationbothelp`",
+        "details": "Use `!help` for detailed command help.",
+    },
+}
+
+
+def _render_help_text(command_name: Optional[str]) -> str:
+    if not command_name:
+        lines = ["Available commands:"]
+        for name in sorted(_COMMAND_HELP.keys()):
+            summary = _COMMAND_HELP[name]["summary"]
+            lines.append(f"!{name} — {summary}")
+        lines.append("\nUse `!help COMMAND` for details.")
+        return "\n".join(lines)
+    normalized = command_name.lower().lstrip("!")
+    info = _COMMAND_HELP.get(normalized)
+    if not info:
+        return (
+            f"Unknown command `{command_name}`.\n"
+            "Use `!help` to list available commands."
+        )
+    return (
+        f"!{normalized}\n"
+        f"{info['summary']}\n\n"
+        f"Usage: {info['usage']}\n"
+        f"{info['details']}"
+    )
+
+
+@bot.command(name="help")
+async def help_command(ctx: commands.Context, command_name: str = ""):
+    await ctx.send(_render_help_text(command_name or None))
+
+
 @bot.command(name="donationbothelp")
 async def donationbothelp(ctx: commands.Context):
-    embed = discord.Embed(
-        title="Donation Bot Commands",
-        description="Leaderboard setup and sizing commands.",
-        color=0x4EA8DE,
-    )
-    embed.add_field(
-        name="Set Leaderboards",
-        value="`!setdonationleaderboard #channel [limit]`",
-        inline=False,
-    )
-    embed.add_field(
-        name="Set Sizes",
-        value="`!setdonationleadersize [limit]`",
-        inline=False,
-    )
-    embed.add_field(
-        name="Snapshots",
-        value="`!snapshotholders`\n`!resetverification`\n`!setexchangewallets`\n`!removeexchangewallets`",
-        inline=False,
-    )
-    embed.add_field(
-        name="Transactions",
-        value="`!tx @user` or `!tx WALLET_ADDRESS`\n`!addtransaction SIGNATURE`",
-        inline=False,
-    )
-    embed.add_field(
-        name="Verification",
-        value="`/verifywallet`\n`/verifystatus`\n`/leaderboard`",
-        inline=False,
-    )
-    embed.add_field(
-        name="Notes",
-        value="Default limit is 30; max 100.",
-        inline=False,
-    )
-    await ctx.send(embed=embed)
+    await ctx.send("Use `!help` for detailed command help.")
 
 
 @bot.command(name="snapshotholders")
@@ -1856,6 +2128,81 @@ async def resetverification(ctx: commands.Context):
     except sqlite3.Error as exc:
         log.exception("Failed to reset verification: %s", exc)
         await ctx.send("Failed to reset verification. Check logs.")
+
+
+@bot.command(name="manualverify")
+@commands.has_permissions(manage_guild=True)
+async def manualverify(
+    ctx: commands.Context,
+    member: discord.Member | None = None,
+    wallet: str = "",
+    visibility: str = "",
+):
+    if not member or not wallet:
+        return await ctx.send(
+            "Usage: `!manualverify @user WALLET_ADDRESS [on/off]`"
+        )
+    wallet = wallet.strip()
+    if not wallet:
+        return await ctx.send("Wallet address is required.")
+    if wallet in _get_exchange_wallets():
+        return await ctx.send(
+            "That wallet is marked as an exchange wallet and cannot be verified."
+        )
+    on_leaderboard = 0
+    if visibility:
+        vis = visibility.strip().lower()
+        if vis in {"on", "true", "1", "yes"}:
+            on_leaderboard = 1
+        elif vis in {"off", "false", "0", "no"}:
+            on_leaderboard = 0
+        else:
+            return await ctx.send(
+                "Visibility must be `on` or `off` if provided."
+            )
+    success = _update_wallet_verification(
+        wallet=wallet,
+        discord_id=str(member.id),
+        discord_name=str(member),
+        on_leaderboard=on_leaderboard,
+    )
+    if not success:
+        return await ctx.send(
+            "Wallet not found in the snapshot. Run a snapshot first."
+        )
+    _set_summary_visibility(str(member.id), on_leaderboard)
+    _recompute_summary_for_discord_id(str(member.id))
+    try:
+        with _connect_db(TX_DB) as tx_conn:
+            tx_conn.execute(
+                f"""
+                UPDATE {TX_TABLE}
+                SET discord_id = ?
+                WHERE sender_wallet = ?
+                """,
+                (str(member.id), wallet),
+            )
+            tx_conn.commit()
+    except sqlite3.Error as exc:
+        log.warning("Failed to update tx discord id for manual verify: %s", exc)
+    await ctx.send(
+        f"Linked `{wallet}` to {member.mention} "
+        f"(leaderboard visibility: {'on' if on_leaderboard else 'off'})."
+    )
+
+
+@bot.command(name="removeverification")
+@commands.has_permissions(manage_guild=True)
+async def removeverification(ctx: commands.Context, target: str = ""):
+    if not target:
+        return await ctx.send(
+            "Usage: `!removeverification WALLET_ADDRESS`"
+        )
+    wallets = [target.strip()]
+    removed = _clear_verification_for_wallets(wallets)
+    if removed == 0:
+        return await ctx.send("No matching wallets were updated.")
+    await ctx.send(f"Removed verification for {removed} wallet(s).")
 
 
 @bot.command(name="setexchangewallets")
@@ -1991,6 +2338,7 @@ async def synccommands(ctx: commands.Context):
             bot.tree.add_command(verify_wallet_otp)
             bot.tree.add_command(verify_status)
             bot.tree.add_command(leaderboard_full)
+            bot.tree.add_command(dm_welcome)
             await bot.tree.sync()
             await ctx.send("Synced global slash commands (DMs enabled).")
         else:
