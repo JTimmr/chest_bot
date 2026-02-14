@@ -380,7 +380,7 @@ async def _send_first_dm_extras(user: discord.User) -> None:
     try:
         await user.send("War chest address:")
         await user.send(war_chest or "War chest address is not configured.")
-        await user.send("Quick commands:", view=VerificationButtonsView())
+        await user.send("Quick commands:", view=VerificationButtonsDMView())
         _mark_intro_dm_sent(discord_id)
     except discord.HTTPException:
         log.warning("Failed to send intro DM extras for discord id %s", discord_id)
@@ -409,7 +409,7 @@ async def _send_full_welcome_dm(user: discord.User) -> bool:
         await user.send(_welcome_message_text())
         await user.send("War chest address:")
         await user.send(war_chest or "War chest address is not configured.")
-        await user.send("Quick commands:", view=VerificationButtonsView())
+        await user.send("Quick commands:", view=VerificationButtonsDMView())
         _mark_intro_dm_sent(discord_id)
         return True
     except discord.HTTPException:
@@ -1468,6 +1468,84 @@ class VerificationButtonsView(discord.ui.View):
             )
 
 
+class VerificationButtonsDMView(discord.ui.View):
+    def __init__(self) -> None:
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Verify wallet",
+        style=discord.ButtonStyle.primary,
+        custom_id="verify_wallet_button_dm",
+        row=0,
+    )
+    async def verify_wallet_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        await interaction.response.send_message(
+            "To verify your wallet, run `/verifywallet` here. "
+            "This is private and only visible to you.",
+            ephemeral=True,
+        )
+
+    @discord.ui.button(
+        label="Verify status",
+        style=discord.ButtonStyle.secondary,
+        custom_id="verify_status_button_dm",
+        row=1,
+    )
+    async def verify_status_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        await verify_status.callback(interaction)
+
+    @discord.ui.button(
+        label="My wallets",
+        style=discord.ButtonStyle.secondary,
+        custom_id="my_wallets_button_dm",
+        row=1,
+    )
+    async def my_wallets_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        await my_wallets.callback(interaction)
+
+    @discord.ui.button(
+        label="My transactions",
+        style=discord.ButtonStyle.secondary,
+        custom_id="my_transactions_button_dm",
+        row=1,
+    )
+    async def my_transactions_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        await my_transactions.callback(interaction)
+
+    @discord.ui.button(
+        label="Leaderboard visibility",
+        style=discord.ButtonStyle.secondary,
+        custom_id="leaderboard_visibility_button_dm",
+        row=2,
+    )
+    async def leaderboard_visibility_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        await interaction.response.send_message(
+            "To change your leaderboard visibility, run `/leaderboardvisibility` here.",
+            ephemeral=True,
+        )
+
+    @discord.ui.button(
+        label="Full leaderboard",
+        style=discord.ButtonStyle.secondary,
+        custom_id="full_leaderboard_button_dm",
+        row=2,
+    )
+    async def full_leaderboard_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        await leaderboard_full.callback(interaction)
+
+
 class LeaderboardBot(commands.Bot):
     def __init__(self, **kwargs):
         super().__init__(command_prefix="!", help_command=None, **kwargs)
@@ -2164,17 +2242,7 @@ _COMMAND_HELP: Dict[str, Dict[str, str]] = {
 
 def _render_help_text(command_name: Optional[str]) -> str:
     if not command_name:
-        lines = ["Available commands:"]
-        for name in sorted(_COMMAND_HELP.keys()):
-            summary = _COMMAND_HELP[name]["summary"]
-            lines.append(f"!{name} — {summary}")
-        lines.append("\nTracking is disabled until you run `!golive`.")
-        lines.append("\nGo-live flow:")
-        lines.append("1) `!snapshotholders`")
-        lines.append("2) `!setdonationleaderboard #channel [limit]`")
-        lines.append("3) `!golive`")
-        lines.append("\nUse `!help COMMAND` for details.")
-        return "\n".join(lines)
+        return ""
     normalized = command_name.lower().lstrip("!")
     info = _COMMAND_HELP.get(normalized)
     if not info:
@@ -2190,9 +2258,85 @@ def _render_help_text(command_name: Optional[str]) -> str:
     )
 
 
+def _build_help_embed(command_name: Optional[str]) -> discord.Embed:
+    if command_name:
+        normalized = command_name.lower().lstrip("!")
+        info = _COMMAND_HELP.get(normalized)
+        if not info:
+            return discord.Embed(
+                title="Unknown command",
+                description=(
+                    f"Unknown command `{command_name}`.\n"
+                    "Use `!help` to list available commands."
+                ),
+                color=0x4EA8DE,
+            )
+        emb = discord.Embed(
+            title=f"!{normalized}",
+            description=info["summary"],
+            color=0x4EA8DE,
+        )
+        emb.add_field(name="Usage", value=info["usage"], inline=False)
+        emb.add_field(name="Details", value=info["details"], inline=False)
+        return emb
+
+    categories = {
+        "Go-live & setup": [
+            "snapshotholders",
+            "setdonationleaderboard",
+            "golive",
+            "settrackerinterval",
+            "setpagelimit",
+            "setdonationleadersize",
+        ],
+        "Verification admin": [
+            "manualverify",
+            "removeverification",
+            "resetverification",
+            "setexchangewallets",
+            "removeexchangewallets",
+        ],
+        "Transactions": [
+            "tx",
+            "addtransaction",
+            "checkwallet",
+        ],
+        "Admin utilities": [
+            "synccommands",
+            "listcommands",
+            "help",
+            "donationbothelp",
+        ],
+    }
+    emb = discord.Embed(
+        title="Donation Bot Commands",
+        description="Use `!help COMMAND` for details.",
+        color=0x4EA8DE,
+    )
+    for title, keys in categories.items():
+        lines = []
+        for key in keys:
+            info = _COMMAND_HELP.get(key)
+            if info:
+                lines.append(f"`!{key}` — {info['summary']}")
+        if lines:
+            emb.add_field(name=title, value="\n".join(lines), inline=False)
+    emb.add_field(
+        name="Go-live flow",
+        value=(
+            "1) `!snapshotholders`\n"
+            "2) `!setdonationleaderboard #channel [limit]`\n"
+            "3) `!golive`"
+        ),
+        inline=False,
+    )
+    emb.set_footer(text="Tracking is disabled until you run !golive.")
+    return emb
+
+
 @bot.command(name="help")
 async def help_command(ctx: commands.Context, command_name: str = ""):
-    await ctx.send(_render_help_text(command_name or None))
+    await ctx.send(embed=_build_help_embed(command_name or None))
 
 
 @bot.command(name="donationbothelp")
