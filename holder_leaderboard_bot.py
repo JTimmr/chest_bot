@@ -175,6 +175,60 @@ def _mark_intro_dm_sent(discord_id: str) -> None:
         log.error("Failed to mark intro DM sent: %s", exc)
 
 
+def _ensure_live_state_schema() -> None:
+    try:
+        with _connect_db(SNAPSHOT_DB) as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS live_state (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    live_enabled INTEGER NOT NULL DEFAULT 0,
+                    enabled_at TEXT
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO live_state (id, live_enabled)
+                VALUES (1, 0)
+                """
+            )
+            conn.commit()
+    except sqlite3.Error as exc:
+        log.error("Failed to ensure live state schema: %s", exc)
+
+
+def _is_live_enabled() -> bool:
+    try:
+        with _connect_db(SNAPSHOT_DB) as conn:
+            row = conn.execute(
+                "SELECT live_enabled FROM live_state WHERE id = 1"
+            ).fetchone()
+        return bool(row and int(row[0] or 0) == 1)
+    except sqlite3.Error:
+        return False
+
+
+def _set_live_enabled(enabled: bool) -> None:
+    try:
+        with _connect_db(SNAPSHOT_DB) as conn:
+            conn.execute(
+                """
+                UPDATE live_state
+                SET live_enabled = ?,
+                    enabled_at = CASE
+                        WHEN ? = 1 THEN datetime('now')
+                        ELSE enabled_at
+                    END
+                WHERE id = 1
+                """,
+                (1 if enabled else 0, 1 if enabled else 0),
+            )
+            conn.commit()
+    except sqlite3.Error as exc:
+        log.error("Failed to set live state: %s", exc)
+
+
 def _ensure_otp_schema() -> None:
     try:
         with _connect_db(SNAPSHOT_DB) as conn:
@@ -1423,12 +1477,14 @@ class LeaderboardBot(commands.Bot):
         self._last_render_hash: dict[str, int] = {"donations": 0, "recent": 0}
         self._tracker: IncomingTracker | None = None
         self._tracker_disabled_logged = False
+        self._live_enabled = False
 
     async def setup_hook(self) -> None:
         _ensure_snapshot_tables()
         _ensure_snapshot_schema()
         _ensure_summary_schema()
         _ensure_dm_state_schema()
+        _ensure_live_state_schema()
         _ensure_otp_schema()
         _ensure_exchange_wallets_schema()
         self.add_view(VerificationButtonsView())
@@ -1451,6 +1507,9 @@ class LeaderboardBot(commands.Bot):
                 if not target_wallet:
                     missing.append("WARCHEST_ADDRESS")
                 log.warning("Tracker disabled. Missing: %s", ", ".join(missing))
+        self._live_enabled = _is_live_enabled()
+        if self._tracker and self._live_enabled:
+            self._tracker.unlimited_backfill = True
         if GUILD_ID:
             if ENABLE_DM_COMMANDS:
                 # Avoid duplicate commands in guild by using global commands only.
@@ -1541,6 +1600,8 @@ class LeaderboardBot(commands.Bot):
 
     @tasks.loop(seconds=TRACKER_INTERVAL_SECONDS)
     async def track_incoming(self) -> None:
+        if not self._live_enabled:
+            return
         if not self._tracker:
             if not self._tracker_disabled_logged:
                 log.warning(
@@ -1964,6 +2025,49 @@ async def setdonationleadersize(ctx: commands.Context, limit: int = DEFAULT_LIMI
     await ctx.send(f"Donation leaderboard size set to {limit}.")
 
 
+@bot.command(name="settrackerinterval")
+@commands.has_permissions(manage_guild=True)
+async def settrackerinterval(ctx: commands.Context, seconds: int = 0):
+    if seconds <= 0:
+        return await ctx.send("Usage: `!settrackerinterval SECONDS`")
+    seconds = max(5, min(seconds, 3600))
+    bot.track_incoming.change_interval(seconds=seconds)
+    await ctx.send(f"Tracker interval set to {seconds} seconds.")
+
+
+@bot.command(name="setpagelimit")
+@commands.has_permissions(manage_guild=True)
+async def setpagelimit(ctx: commands.Context, limit: int = 0):
+    if limit <= 0:
+        return await ctx.send("Usage: `!setpagelimit LIMIT`")
+    limit = max(1, min(limit, 1000))
+    if not bot._tracker:
+        return await ctx.send("Tracker is not configured (missing env vars).")
+    bot._tracker.page_limit = limit
+    await ctx.send(f"Tracker page limit set to {limit} signatures per address.")
+
+
+@bot.command(name="golive")
+@commands.has_permissions(manage_guild=True)
+async def golive(ctx: commands.Context):
+    if not bot._tracker:
+        return await ctx.send("Tracker is not configured (missing env vars).")
+    if _is_live_enabled():
+        return await ctx.send("Already live. Tracking is enabled.")
+    await ctx.send("Setting checkpoint to current on-chain state...")
+    try:
+        address_count = await bot._tracker.init_checkpoint()
+    except Exception as exc:
+        log.exception("Failed to set go-live checkpoint: %s", exc)
+        return await ctx.send("Failed to set checkpoint. Check logs.")
+    _set_live_enabled(True)
+    bot._live_enabled = True
+    bot._tracker.unlimited_backfill = True
+    await ctx.send(
+        f"Checkpoint set for {address_count} address(es). Tracking is live."
+    )
+
+
 _COMMAND_HELP: Dict[str, Dict[str, str]] = {
     "help": {
         "summary": "Show help for bot commands.",
@@ -1985,15 +2089,30 @@ _COMMAND_HELP: Dict[str, Dict[str, str]] = {
         "usage": "`!setdonationleadersize [limit]`",
         "details": "Limit is clamped between 1 and 100.",
     },
+    "settrackerinterval": {
+        "summary": "Update the Helius polling interval (seconds).",
+        "usage": "`!settrackerinterval SECONDS`",
+        "details": "Lower values poll more often; higher values reduce API usage.",
+    },
+    "setpagelimit": {
+        "summary": "Update signatures per address page in Helius polling.",
+        "usage": "`!setpagelimit LIMIT`",
+        "details": "Higher values scan more signatures per run.",
+    },
+    "golive": {
+        "summary": "Set a fresh checkpoint so old transactions are ignored.",
+        "usage": "`!golive`",
+        "details": "Enables tracking and starts from the latest signatures.",
+    },
     "snapshotholders": {
         "summary": "Run the holder snapshot script.",
         "usage": "`!snapshotholders`",
-        "details": "Takes a few minutes; check logs for errors.",
+        "details": "Run after a fresh reset to populate balances before go-live.",
     },
     "resetverification": {
         "summary": "Clear all verification data.",
         "usage": "`!resetverification`",
-        "details": "Removes all linked wallets and OTPs.",
+        "details": "Use only if you need to wipe verification state before go-live.",
     },
     "setexchangewallets": {
         "summary": "Mark wallets as exchange wallets.",
@@ -2049,6 +2168,11 @@ def _render_help_text(command_name: Optional[str]) -> str:
         for name in sorted(_COMMAND_HELP.keys()):
             summary = _COMMAND_HELP[name]["summary"]
             lines.append(f"!{name} — {summary}")
+        lines.append("\nTracking is disabled until you run `!golive`.")
+        lines.append("\nGo-live flow:")
+        lines.append("1) `!snapshotholders`")
+        lines.append("2) `!setdonationleaderboard #channel [limit]`")
+        lines.append("3) `!golive`")
         lines.append("\nUse `!help COMMAND` for details.")
         return "\n".join(lines)
     normalized = command_name.lower().lstrip("!")

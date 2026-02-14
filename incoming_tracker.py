@@ -268,7 +268,7 @@ async def track_incoming_multi(
     fartboy_mint: str,
     addresses: List[str],
     checkpoint_map: Dict[str, Optional[str]],
-    max_pages: int,
+    max_pages: Optional[int],
     page_limit: int,
     request_delay: float,
 ) -> Tuple[List[Dict], Dict[str, Optional[str]]]:
@@ -283,7 +283,10 @@ async def track_incoming_multi(
         before_sig: Optional[str] = None
         new_checkpoint: Optional[str] = None
         collected: List[str] = []
-        for page_idx in range(max_pages):
+        page_idx = 0
+        while True:
+            if max_pages is not None and page_idx >= max_pages:
+                break
             sigs = await client.get_signatures_for_address(
                 address, limit=page_limit, before=before_sig
             )
@@ -303,6 +306,7 @@ async def track_incoming_multi(
             before_sig = sigs[-1].get("signature")
             if not before_sig:
                 break
+            page_idx += 1
         return collected, new_checkpoint
 
     async with HeliusRPCClient(api_key, request_delay=request_delay) as client:
@@ -676,7 +680,7 @@ class IncomingTracker:
         snapshot_table: str = "fartboy_holders",
         checkpoint_file: str = "data/incoming_checkpoint.txt",
         delay: float = 0.1,
-        max_pages: int = 3,
+        max_pages: Optional[int] = 3,
         page_limit: int = 10,
         account_refresh_seconds: int = 0,
     ) -> None:
@@ -689,11 +693,15 @@ class IncomingTracker:
         self.snapshot_table = snapshot_table
         self.checkpoint_file = checkpoint_file
         self.delay = max(0.05, delay)
-        self.max_pages = max_pages
+        if max_pages is None or max_pages <= 0:
+            self.max_pages = None
+        else:
+            self.max_pages = max_pages
         self.page_limit = min(max(page_limit, 1), 1000)
         self.account_refresh_seconds = max(30, account_refresh_seconds)
         self._last_accounts_refresh = 0.0
         self._cached_addresses: List[str] = []
+        self.unlimited_backfill = False
 
     async def _get_tracked_addresses(self) -> List[str]:
         now = time.time()
@@ -722,13 +730,14 @@ class IncomingTracker:
         checkpoint_map = _load_checkpoint_map(self.checkpoint_file)
         addresses = await self._get_tracked_addresses()
 
+        max_pages = None if self.unlimited_backfill else self.max_pages
         rows, new_checkpoint_map = await track_incoming_multi(
             target_wallet=self.target_wallet,
             api_key=self.api_key,
             fartboy_mint=self.fartboy_mint,
             addresses=addresses,
             checkpoint_map=checkpoint_map,
-            max_pages=self.max_pages,
+            max_pages=max_pages,
             page_limit=self.page_limit,
             request_delay=self.delay,
         )
@@ -840,6 +849,17 @@ class IncomingTracker:
             tx_conn.close()
             snapshot_conn.close()
         return len(rows), sender_wallets, verified_discord_ids
+
+    async def init_checkpoint(self) -> int:
+        addresses = await self._get_tracked_addresses()
+        checkpoint_map: Dict[str, Optional[str]] = {}
+        async with HeliusRPCClient(self.api_key, request_delay=self.delay) as client:
+            for address in addresses:
+                sigs = await client.get_signatures_for_address(address, limit=1)
+                latest = sigs[0].get("signature") if sigs else None
+                checkpoint_map[address] = latest or None
+        _save_checkpoint_map(self.checkpoint_file, checkpoint_map)
+        return len(addresses)
 
 
 async def _fetch_jupiter_price_usdc(session: aiohttp.ClientSession, mint: str) -> float:
@@ -993,7 +1013,12 @@ def main() -> None:
         help="Target wallet address to track (or WARCHEST_ADDRESS env var)",
     )
     parser.add_argument("--api-key", default=None, help="Helius API key (or HELIUS_API_KEY env var)")
-    parser.add_argument("--max-pages", type=int, default=1, help="Max pages to scan (1000 sigs/page)")
+    parser.add_argument(
+        "--max-pages",
+        type=int,
+        default=1,
+        help="Max pages to scan (0 = no limit)",
+    )
     parser.add_argument("--page-limit", type=int, default=10, help="Signatures per page (max 1000)")
     parser.add_argument("--delay", type=float, default=0.1, help="Delay between RPC requests (seconds)")
     parser.add_argument("--tx-db", default="data/incoming_transactions.db", help="Transactions SQLite DB")
@@ -1021,6 +1046,7 @@ def main() -> None:
     fartboy_mint = os.getenv("FARTBOY_MINT")
     if not fartboy_mint:
         raise SystemExit("ERROR: Missing FARTBOY_MINT in environment.")
+    max_pages = None if args.max_pages <= 0 else args.max_pages
     tracker = IncomingTracker(
         api_key=api_key,
         target_wallet=target_wallet,
@@ -1031,7 +1057,7 @@ def main() -> None:
         snapshot_table=args.snapshot_table,
         checkpoint_file=args.checkpoint_file,
         delay=args.delay,
-        max_pages=args.max_pages,
+        max_pages=max_pages,
         page_limit=args.page_limit,
     )
 
