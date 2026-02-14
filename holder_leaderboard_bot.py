@@ -1218,7 +1218,7 @@ def _render_donations_embed(limit: int) -> discord.Embed:
     donors = _fetch_top_donors(limit)
     total_donations = _fetch_total_donations_usd()
     emb = discord.Embed(
-        title=f"Top {limit} Donations",
+        title="Top 100 Donors",
         color=0xFFD166,
         timestamp=datetime.now(timezone.utc),
     )
@@ -1255,7 +1255,7 @@ def _render_donations_embed(limit: int) -> discord.Embed:
 
 def _render_recent_transactions_embed(limit: int = 20) -> discord.Embed:
     emb = discord.Embed(
-        title="Recent Incoming Transactions",
+        title="Recent Incoming Donations",
         color=0x4EA8DE,
         timestamp=datetime.now(timezone.utc),
     )
@@ -2204,8 +2204,8 @@ _COMMAND_HELP: Dict[str, Dict[str, str]] = {
     },
     "manualverify": {
         "summary": "Manually link a wallet to a Discord user.",
-        "usage": "`!manualverify @user WALLET_ADDRESS [on/off]`",
-        "details": "Optionally set leaderboard visibility with on/off.",
+        "usage": "`!manualverify @user WALLET_ADDRESS`",
+        "details": "Leaderboard visibility stays off until the user opts in.",
     },
     "removeverification": {
         "summary": "Remove verification for a user or wallet.",
@@ -2281,13 +2281,10 @@ def _build_help_embed(command_name: Optional[str]) -> discord.Embed:
         return emb
 
     categories = {
-        "Go-live & setup": [
+        "Go-live": [
             "snapshotholders",
             "setdonationleaderboard",
             "golive",
-            "settrackerinterval",
-            "setpagelimit",
-            "setdonationleadersize",
         ],
         "Verification admin": [
             "manualverify",
@@ -2302,6 +2299,9 @@ def _build_help_embed(command_name: Optional[str]) -> discord.Embed:
             "checkwallet",
         ],
         "Admin utilities": [
+            "settrackerinterval",
+            "setpagelimit",
+            "setdonationleadersize",
             "synccommands",
             "listcommands",
             "help",
@@ -2404,11 +2404,10 @@ async def manualverify(
     ctx: commands.Context,
     member: discord.Member | None = None,
     wallet: str = "",
-    visibility: str = "",
 ):
     if not member or not wallet:
         return await ctx.send(
-            "Usage: `!manualverify @user WALLET_ADDRESS [on/off]`"
+            "Usage: `!manualverify @user WALLET_ADDRESS`"
         )
     wallet = wallet.strip()
     if not wallet:
@@ -2418,16 +2417,6 @@ async def manualverify(
             "That wallet is marked as an exchange wallet and cannot be verified."
         )
     on_leaderboard = 0
-    if visibility:
-        vis = visibility.strip().lower()
-        if vis in {"on", "true", "1", "yes"}:
-            on_leaderboard = 1
-        elif vis in {"off", "false", "0", "no"}:
-            on_leaderboard = 0
-        else:
-            return await ctx.send(
-                "Visibility must be `on` or `off` if provided."
-            )
     success = _update_wallet_verification(
         wallet=wallet,
         discord_id=str(member.id),
@@ -2454,8 +2443,7 @@ async def manualverify(
     except sqlite3.Error as exc:
         log.warning("Failed to update tx discord id for manual verify: %s", exc)
     await ctx.send(
-        f"Linked `{wallet}` to {member.mention} "
-        f"(leaderboard visibility: {'on' if on_leaderboard else 'off'})."
+        f"Linked `{wallet}` to {member.mention} (leaderboard visibility: off)."
     )
 
 
