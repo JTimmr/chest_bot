@@ -7,6 +7,9 @@ services:
     restart: unless-stopped
     env_file:
       - .env
+    ports:
+      # Expose the REST API (only when API_KEY is set in .env)
+      - "${API_PORT:-8000}:${API_PORT:-8000}"
     volumes:
       # Mount .env file if you want to update it without rebuilding
       - ./.env:/app/.env:ro

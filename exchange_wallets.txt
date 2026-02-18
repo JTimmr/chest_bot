@@ -2,3 +2,13 @@
 # One wallet address per line. You can add a label after a space if you want.
 # Example:
 # Binance 7KbPKhNVbK7LPSP4yGs7JHyxe2Bb2dkXdsxxhCRuRoHa
+Coinbase FpwQQhQQoEaVu3WU2qZMfF1hx48YyfwsLoRgXG83E99Q
+OKX ARu4n5mFdZogZAravu7CcizaojWnS6oqka37gdLT5SZn
+MEXC ASTyfSima4LLAdDgoFGkgqoKowG1LZFDr9fAQrg7iaJZ
+Coinbase 5g7yNHyGLJ7fiQ9SN9mf47opDnMjc585kqXWt6d7aBWs
+Coinbase DPqsobysNf5iA9w7zrQM8HLzCKZEDMkZsWbiidsAt1xo
+Coinbase 2AQdpHJ2JpcEgPiATUXjQxA8QmafFegfQwSLWSprPicm
+Coinbase GJRs4FwHtemZ5ZE9x3FNvJ8TMwitKTh21yxdRPqn7npE
+Coinbase D89hHJT5Aqyx1trP6EnGY9jJUB3whgnq3aUvvCqedvzf
+Coinbase H8sMJSCQxfKiFTCfDR3DUMLPwcRbM61LGFJ8N4dK3WjS
+Coinbase 9obNtb5GyUegcs3a1CbBkLuc5hEWynWfJC6gjz5uWQkE

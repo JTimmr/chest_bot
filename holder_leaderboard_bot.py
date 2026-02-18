@@ -21,6 +21,7 @@ from incoming_tracker import (
     IncomingTracker,
     HeliusRPCClient,
     USDC_MINT,
+    USDT_MINT,
     SOL_DECIMALS,
     _init_transactions_db,
     _to_iso,
@@ -62,6 +63,7 @@ RPC_REQUEST_DELAY = float(os.getenv("RPC_REQUEST_DELAY", "0.1"))
 SUMMARY_TABLE = os.getenv("SUMMARY_TABLE", "verified_users")
 OTP_TABLE = os.getenv("OTP_TABLE", "otp_registry")
 OTP_EXPIRY_SECONDS = int(os.getenv("OTP_EXPIRY_SECONDS", "3600"))
+COMMAND_CHANNEL_ID = os.getenv("COMMAND_CHANNEL_ID")
 _SNAPSHOT_COLUMNS: Set[str] | None = None
 
 
@@ -262,6 +264,162 @@ def _ensure_exchange_wallets_schema() -> None:
             conn.commit()
     except sqlite3.Error as exc:
         log.error("Failed to ensure exchange wallets schema: %s", exc)
+
+
+def _ensure_targets_schema() -> None:
+    """Create the targets table in STATE_DB for fundraising milestones."""
+    try:
+        with _connect_db(STATE_DB) as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS targets (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    target_amount REAL NOT NULL,
+                    target_name TEXT,
+                    is_active INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT,
+                    completed_at TEXT,
+                    order_index INTEGER NOT NULL DEFAULT 0
+                )
+                """
+            )
+            conn.commit()
+    except sqlite3.Error as exc:
+        log.error("Failed to ensure targets schema: %s", exc)
+
+
+def _add_target(amount: float, name: str | None = None) -> int | None:
+    """Add a new fundraising target. Returns the new target id."""
+    try:
+        with _connect_db(STATE_DB) as conn:
+            row = conn.execute("SELECT MAX(order_index) FROM targets").fetchone()
+            next_order = int(row[0] or 0) + 1 if row and row[0] is not None else 1
+            cur = conn.execute(
+                """
+                INSERT INTO targets (target_amount, target_name, is_active, created_at, order_index)
+                VALUES (?, ?, 1, datetime('now'), ?)
+                """,
+                (amount, name, next_order),
+            )
+            conn.commit()
+            return cur.lastrowid
+    except sqlite3.Error as exc:
+        log.error("Failed to add target: %s", exc)
+        return None
+
+
+def _remove_target(target_id: int) -> bool:
+    """Deactivate a target by id."""
+    try:
+        with _connect_db(STATE_DB) as conn:
+            cur = conn.execute(
+                "UPDATE targets SET is_active = 0 WHERE id = ?",
+                (target_id,),
+            )
+            conn.commit()
+            return cur.rowcount > 0
+    except sqlite3.Error as exc:
+        log.error("Failed to remove target: %s", exc)
+        return False
+
+
+def _fetch_targets() -> List[Dict]:
+    """Fetch all active targets ordered by order_index."""
+    try:
+        with _connect_db(STATE_DB) as conn:
+            rows = conn.execute(
+                """
+                SELECT id, target_amount, target_name, is_active, created_at, completed_at, order_index
+                FROM targets
+                WHERE is_active = 1
+                ORDER BY order_index ASC
+                """
+            ).fetchall()
+        return [
+            {
+                "id": r[0],
+                "target_amount": float(r[1]),
+                "target_name": r[2],
+                "is_active": bool(r[3]),
+                "created_at": r[4],
+                "completed_at": r[5],
+                "order_index": r[6],
+            }
+            for r in rows
+        ]
+    except sqlite3.Error as exc:
+        log.error("Failed to fetch targets: %s", exc)
+        return []
+
+
+def _update_target_completion(total_raised: float) -> None:
+    """Mark targets as completed if total_raised meets them."""
+    try:
+        with _connect_db(STATE_DB) as conn:
+            conn.execute(
+                """
+                UPDATE targets
+                SET completed_at = datetime('now')
+                WHERE is_active = 1
+                  AND completed_at IS NULL
+                  AND target_amount <= ?
+                """,
+                (total_raised,),
+            )
+            conn.commit()
+    except sqlite3.Error as exc:
+        log.error("Failed to update target completion: %s", exc)
+
+
+def _fetch_next_target(total_raised: float) -> Dict | None:
+    """Fetch the next uncompleted target."""
+    try:
+        with _connect_db(STATE_DB) as conn:
+            row = conn.execute(
+                """
+                SELECT id, target_amount, target_name, created_at, order_index
+                FROM targets
+                WHERE is_active = 1 AND (completed_at IS NULL OR target_amount > ?)
+                ORDER BY order_index ASC
+                LIMIT 1
+                """,
+                (total_raised,),
+            ).fetchone()
+        if not row:
+            return None
+        return {
+            "id": row[0],
+            "target_amount": float(row[1]),
+            "target_name": row[2],
+            "created_at": row[3],
+            "order_index": row[4],
+        }
+    except sqlite3.Error as exc:
+        log.error("Failed to fetch next target: %s", exc)
+        return None
+
+
+def _fetch_total_by_token() -> Dict[str, float]:
+    """Fetch total raised broken down by token type."""
+    result = {"USDC": 0.0, "USDT": 0.0, "FARTBOY": 0.0, "SOL": 0.0}
+    try:
+        _ensure_tx_table()
+        with sqlite3.connect(TX_DB) as conn:
+            rows = conn.execute(
+                f"""
+                SELECT token, SUM(value_usdc)
+                FROM {TX_TABLE}
+                GROUP BY token
+                """
+            ).fetchall()
+        for token, total in rows:
+            if token in result:
+                result[token] = float(total or 0)
+            else:
+                result[token] = float(total or 0)
+    except sqlite3.Error as exc:
+        log.error("Failed to fetch totals by token: %s", exc)
+    return result
 
 
 def _get_exchange_wallets() -> Set[str]:
@@ -909,7 +1067,7 @@ async def _process_signature(signature: str, discord_id: str | None = None) -> T
                 }
             )
 
-        allowed_spl_mints = {fartboy_mint, USDC_MINT}
+        allowed_spl_mints = {fartboy_mint, USDC_MINT, USDT_MINT}
         for inst in _iter_token_transfer_instructions(tx):
             parsed = _parse_transfer(inst, token_map)
             if not parsed:
@@ -923,6 +1081,12 @@ async def _process_signature(signature: str, discord_id: str | None = None) -> T
                 continue
             if mint not in allowed_spl_mints:
                 continue
+            if mint == fartboy_mint:
+                token_label = "FARTBOY"
+            elif mint == USDT_MINT:
+                token_label = "USDT"
+            else:
+                token_label = "USDC"
             rows.append(
                 {
                     "signature": signature,
@@ -930,7 +1094,7 @@ async def _process_signature(signature: str, discord_id: str | None = None) -> T
                     "amount_raw": amount_raw,
                     "amount_ui": _ui_amount(amount_raw, decimals),
                     "decimals": decimals,
-                    "token": "FARTBOY" if mint == fartboy_mint else "USDC",
+                    "token": token_label,
                     "sender_wallet": source_owner,
                 }
             )
@@ -1214,6 +1378,31 @@ def _clear_verification_for_wallets(wallets: List[str]) -> int:
         return 0
 
 
+def _render_progress_bar(current: float, target: float, width: int = 20) -> str:
+    """Render a text-based progress bar for Discord embeds."""
+    if target <= 0:
+        return ""
+    ratio = min(1.0, max(0.0, current / target))
+    filled = round(ratio * width)
+    empty = width - filled
+    bar = "█" * filled + "░" * empty
+    pct = ratio * 100
+    return f"`{bar}` {pct:.1f}%"
+
+
+def _render_target_field(total_raised: float) -> str | None:
+    """Build the target/milestone progress string for the embed."""
+    _update_target_completion(total_raised)
+    next_target = _fetch_next_target(total_raised)
+    if not next_target:
+        return None
+    amount = next_target["target_amount"]
+    name = next_target.get("target_name")
+    bar = _render_progress_bar(total_raised, amount)
+    label = f'"{name}" — ' if name else ""
+    return f"{label}${total_raised:,.2f} / ${amount:,.2f}\n{bar}"
+
+
 def _render_donations_embed(limit: int) -> discord.Embed:
     donors = _fetch_top_donors(limit)
     total_donations = _fetch_total_donations_usd()
@@ -1227,6 +1416,16 @@ def _render_donations_embed(limit: int) -> discord.Embed:
         value=f"${total_donations:,.2f}",
         inline=False,
     )
+
+    # Progress bar toward next target
+    target_text = _render_target_field(total_donations)
+    if target_text:
+        emb.add_field(
+            name="Next target",
+            value=target_text,
+            inline=False,
+        )
+
     if not donors:
         emb.add_field(name="No data", value="No donations recorded yet.", inline=False)
         emb.set_footer(text="Updated")
@@ -1565,6 +1764,7 @@ class LeaderboardBot(commands.Bot):
         _ensure_live_state_schema()
         _ensure_otp_schema()
         _ensure_exchange_wallets_schema()
+        _ensure_targets_schema()
         self.add_view(VerificationButtonsView())
         if not self._tracker:
             api_key = os.getenv("HELIUS_API_KEY")
@@ -1731,12 +1931,33 @@ class LeaderboardBot(commands.Bot):
     async def on_ready(self) -> None:
         log.info("Leaderboard bot ready as %s", self.user)
 
+    async def on_command_error(self, ctx: commands.Context, error: Exception) -> None:
+        # Silently ignore commands sent outside the designated command channel.
+        if isinstance(error, commands.CheckFailure) and getattr(error, "_channel_restricted", False):
+            return
+        await super().on_command_error(ctx, error)
+
+
+class _ChannelRestricted(commands.CheckFailure):
+    """Raised when a ! command is used outside the designated command channel."""
+    _channel_restricted = True
+
+
+def _command_channel_check(ctx: commands.Context) -> bool:
+    """Global check: if COMMAND_CHANNEL_ID is set, only allow ! commands in that channel."""
+    if not COMMAND_CHANNEL_ID:
+        return True  # No restriction configured.
+    if ctx.channel and str(ctx.channel.id) == COMMAND_CHANNEL_ID:
+        return True
+    raise _ChannelRestricted()
+
 
 intents = discord.Intents.default()
 intents.guilds = True
 intents.message_content = True
 
 bot = LeaderboardBot(intents=intents)
+bot.add_check(_command_channel_check)
 
 
 @app_commands.command(
@@ -2210,7 +2431,7 @@ _COMMAND_HELP: Dict[str, Dict[str, str]] = {
     "removeverification": {
         "summary": "Remove verification for a user or wallet.",
         "usage": "`!removeverification WALLET_ADDRESS`",
-        "details": "Clears the linked wallet and removes donation links.",
+        "details": "Dangerous: unlinks that wallet and clears any donation links.",
     },
     "synccommands": {
         "summary": "Sync slash commands.",
@@ -2230,7 +2451,7 @@ _COMMAND_HELP: Dict[str, Dict[str, str]] = {
     "addtransaction": {
         "summary": "Manually record a transaction signature.",
         "usage": "`!addtransaction SIGNATURE [@user]`",
-        "details": "Only records transfers into the war chest.",
+        "details": "Optional @user links the donation to that user (including exchange sends).",
     },
     "donationbothelp": {
         "summary": "Legacy help command.",
@@ -2685,10 +2906,108 @@ async def setleaderboard_error(ctx: commands.Context, error: Exception):
         await ctx.send("Failed to set leaderboard. Check logs.")
 
 
+@bot.command(name="settarget")
+@commands.has_permissions(manage_guild=True)
+async def settarget(ctx: commands.Context, amount: str = "", *, name: str = ""):
+    """Add a fundraising target. Usage: !settarget <amount> [name]"""
+    if not amount:
+        return await ctx.send("Usage: `!settarget <amount_usd> [name]`\nExample: `!settarget 25000 Phase 2`")
+    try:
+        target_amount = float(amount.replace(",", "").replace("$", ""))
+        if target_amount <= 0:
+            return await ctx.send("Target amount must be positive.")
+    except ValueError:
+        return await ctx.send("Invalid amount. Use a number like `25000` or `25000.00`.")
+
+    target_name = name.strip() or None
+    target_id = _add_target(target_amount, target_name)
+    if target_id is None:
+        return await ctx.send("Failed to add target. Check logs.")
+    label = f" ({target_name})" if target_name else ""
+    await ctx.send(f"Target #{target_id} added: **${target_amount:,.2f}**{label}")
+
+
+@bot.command(name="removetarget")
+@commands.has_permissions(manage_guild=True)
+async def removetarget(ctx: commands.Context, target_id: str = ""):
+    """Remove a fundraising target by ID. Usage: !removetarget <id>"""
+    if not target_id:
+        return await ctx.send("Usage: `!removetarget <id>`\nUse `!targets` to see all targets and their IDs.")
+    try:
+        tid = int(target_id)
+    except ValueError:
+        return await ctx.send("Target ID must be a number.")
+    success = _remove_target(tid)
+    if success:
+        await ctx.send(f"Target #{tid} removed.")
+    else:
+        await ctx.send(f"Target #{tid} not found or already removed.")
+
+
+@bot.command(name="targets")
+async def targets_cmd(ctx: commands.Context):
+    """Show all active fundraising targets."""
+    targets = _fetch_targets()
+    total_raised = _fetch_total_donations_usd()
+    _update_target_completion(total_raised)
+
+    if not targets:
+        return await ctx.send("No active targets set. Admins can use `!settarget <amount> [name]`.")
+
+    lines = [f"**Total Raised: ${total_raised:,.2f}**\n"]
+    for t in targets:
+        progress = (total_raised / t["target_amount"] * 100) if t["target_amount"] > 0 else 0
+        progress = min(100.0, progress)
+        status = "completed" if t["completed_at"] else f"{progress:.1f}%"
+        label = f' "{t["target_name"]}"' if t["target_name"] else ""
+        lines.append(
+            f"#{t['id']}: **${t['target_amount']:,.2f}**{label} — {status}"
+        )
+
+    next_target = _fetch_next_target(total_raised)
+    if next_target:
+        progress = (total_raised / next_target["target_amount"] * 100) if next_target["target_amount"] > 0 else 0
+        label = f' ({next_target["target_name"]})' if next_target.get("target_name") else ""
+        lines.append(f"\n**Next target:** ${next_target['target_amount']:,.2f}{label} — {min(100.0, progress):.1f}%")
+
+    await ctx.send("\n".join(lines))
+
+
+@settarget.error
+@removetarget.error
+async def target_error(ctx: commands.Context, error: Exception):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("You need **Manage Server** to run this.")
+    else:
+        log.exception("Target command error: %s", error)
+        await ctx.send("Failed to execute target command. Check logs.")
+
+
 def main() -> None:
     token = os.getenv("DISCORD_BOT_TOKEN")
     if not token:
         raise SystemExit("ERROR: Missing DISCORD_BOT_TOKEN in environment.")
+
+    # Start API server in-process if API_KEY is configured.
+    api_key = os.getenv("API_KEY")
+    if api_key:
+        import threading
+        import uvicorn
+        from api_server import create_api_app
+
+        api_app = create_api_app()
+        api_port = int(os.getenv("API_PORT", "8000"))
+        api_host = os.getenv("API_HOST", "0.0.0.0")
+
+        def run_api():
+            uvicorn.run(api_app, host=api_host, port=api_port, log_level="info")
+
+        api_thread = threading.Thread(target=run_api, daemon=True)
+        api_thread.start()
+        log.info("API server started on %s:%s", api_host, api_port)
+    else:
+        log.info("API_KEY not set; API server disabled.")
+
     bot.run(token)
 
 

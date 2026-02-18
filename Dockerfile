@@ -14,6 +14,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY holder_leaderboard_bot.py .
 COPY snapshot_fartboy_holders.py .
 COPY incoming_tracker.py .
+COPY api_server.py .
 
 # Run the bot
 CMD ["python", "holder_leaderboard_bot.py"]

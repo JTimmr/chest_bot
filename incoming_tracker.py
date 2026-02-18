@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Track incoming transfers (FARTBOY + USDC SPL, and SOL) into a single wallet.
+Track incoming transfers (FARTBOY + USDC + USDT SPL, and SOL) into a single wallet.
 
 Stores each transfer in a transactions database and updates a snapshot database
 with donated FARTBOY and USD values by sender wallet.
@@ -24,6 +24,7 @@ load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 MAX_RETRIES = 6
 RETRY_DELAY_BASE = 1.0
 USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+USDT_MINT = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
 SOL_MINT = "So11111111111111111111111111111111111111112"
 SOL_DECIMALS = 9
 OTP_TABLE = os.getenv("OTP_TABLE", "otp_registry")
@@ -273,7 +274,7 @@ async def track_incoming_multi(
     request_delay: float,
 ) -> Tuple[List[Dict], Dict[str, Optional[str]]]:
     results: List[Dict] = []
-    allowed_spl_mints = {fartboy_mint, USDC_MINT}
+    allowed_spl_mints = {fartboy_mint, USDC_MINT, USDT_MINT}
     new_checkpoint_map: Dict[str, Optional[str]] = {}
     signatures_to_process: List[str] = []
 
@@ -361,6 +362,13 @@ async def track_incoming_multi(
                 if mint not in allowed_spl_mints:
                     continue
 
+                if mint == fartboy_mint:
+                    token_label = "FARTBOY"
+                elif mint == USDT_MINT:
+                    token_label = "USDT"
+                else:
+                    token_label = "USDC"
+
                 results.append(
                     {
                         "signature": signature,
@@ -368,7 +376,7 @@ async def track_incoming_multi(
                         "amount_raw": amount_raw,
                         "amount_ui": _ui_amount(amount_raw, decimals),
                         "decimals": decimals,
-                        "token": "FARTBOY" if mint == fartboy_mint else "USDC",
+                        "token": token_label,
                         "sender_wallet": source_owner,
                     }
                 )
@@ -643,9 +651,12 @@ def _calculate_values(
     if token == "FARTBOY":
         value_usdc = amount_ui * fartboy_usdc_price
         value_fartboy = amount_ui
+    elif token in ("USDC", "USDT"):
+        value_usdc = amount_ui * token_usdc_price
+        value_fartboy = value_usdc / fartboy_usdc_price if fartboy_usdc_price > 0 else 0.0
     else:
         value_usdc = amount_ui * token_usdc_price
-        value_fartboy = value_usdc / fartboy_usdc_price
+        value_fartboy = value_usdc / fartboy_usdc_price if fartboy_usdc_price > 0 else 0.0
     return value_usdc, value_fartboy
 
 
@@ -718,7 +729,10 @@ class IncomingTracker:
             usdc_accounts = await client.get_token_accounts_by_owner(
                 self.target_wallet, USDC_MINT
             )
-        for acc in fartboy_accounts + usdc_accounts:
+            usdt_accounts = await client.get_token_accounts_by_owner(
+                self.target_wallet, USDT_MINT
+            )
+        for acc in fartboy_accounts + usdc_accounts + usdt_accounts:
             pubkey = acc.get("pubkey")
             if pubkey:
                 addresses.append(pubkey)
@@ -985,7 +999,7 @@ async def _compute_values_for_rows(rows: List[Dict], fartboy_mint: str) -> List[
 
         for row in rows:
             token = row["token"]
-            if token == "USDC":
+            if token in ("USDC", "USDT"):
                 token_price = 1.0
             elif token == "SOL":
                 token_price = await get_price_at(SOL_MINT, row.get("timestamp"))
@@ -1005,7 +1019,7 @@ async def _compute_values_for_rows(rows: List[Dict], fartboy_mint: str) -> List[
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Track incoming FARTBOY + USDC (SPL) and SOL transfers to a wallet."
+        description="Track incoming FARTBOY + USDC + USDT (SPL) and SOL transfers to a wallet."
     )
     parser.add_argument(
         "--wallet",
