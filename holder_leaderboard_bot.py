@@ -2458,6 +2458,21 @@ _COMMAND_HELP: Dict[str, Dict[str, str]] = {
         "usage": "`!donationbothelp`",
         "details": "Use `!help` for detailed command help.",
     },
+    "settarget": {
+        "summary": "Add a new fundraising target/milestone.",
+        "usage": "`!settarget <amount> [name]`",
+        "details": "Amount is in USD. Name is optional (e.g. `!settarget 5000 Marketing Fund`).",
+    },
+    "removetarget": {
+        "summary": "Remove a fundraising target by ID.",
+        "usage": "`!removetarget <id>`",
+        "details": "Use `!targets` to see target IDs.",
+    },
+    "targets": {
+        "summary": "Show all active targets and progress.",
+        "usage": "`!targets`",
+        "details": "Displays each target with current progress in USD and percentage.",
+    },
 }
 
 
@@ -2518,6 +2533,11 @@ def _build_help_embed(command_name: Optional[str]) -> discord.Embed:
             "tx",
             "addtransaction",
             "checkwallet",
+        ],
+        "Targets": [
+            "settarget",
+            "removetarget",
+            "targets",
         ],
         "Admin utilities": [
             "settrackerinterval",
