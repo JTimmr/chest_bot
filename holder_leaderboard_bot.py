@@ -1387,7 +1387,7 @@ def _render_progress_bar(current: float, target: float, width: int = 20) -> str:
     empty = width - filled
     bar = "█" * filled + "░" * empty
     pct = ratio * 100
-    return f"`{bar}` {pct:.5f}%"
+    return f"`{bar}` {pct:.2f}%"
 
 
 def _render_target_field(total_raised: float) -> str | None:
