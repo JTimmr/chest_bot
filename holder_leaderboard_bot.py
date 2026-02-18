@@ -1387,7 +1387,7 @@ def _render_progress_bar(current: float, target: float, width: int = 20) -> str:
     empty = width - filled
     bar = "█" * filled + "░" * empty
     pct = ratio * 100
-    return f"`{bar}` {pct:.1f}%"
+    return f"`{bar}` {pct:.5f}%"
 
 
 def _render_target_field(total_raised: float) -> str | None:
@@ -1399,7 +1399,7 @@ def _render_target_field(total_raised: float) -> str | None:
     amount = next_target["target_amount"]
     name = next_target.get("target_name")
     bar = _render_progress_bar(total_raised, amount)
-    label = f'"{name}" — ' if name else ""
+    label = f'{name} — ' if name else ""
     return f"{label}${total_raised:,.2f} / ${amount:,.2f}\n{bar}"
 
 
