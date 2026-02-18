@@ -2305,7 +2305,7 @@ async def setdonationleaderboard(
     _save_state("recent", channel.id, recent_msg.id, 20)
     war_chest = os.getenv("WARCHEST_ADDRESS", "")
     await channel.send(
-        "Send FARTBOY, SOL or USDC to the following address to donate:"
+        "Send FARTBOY, SOL USDT or USDC to the following SOLANA address to donate:"
     )
     await channel.send(war_chest)
     info = (
