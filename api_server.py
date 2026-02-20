@@ -11,8 +11,10 @@ import sqlite3
 from datetime import datetime, timezone
 from typing import List, Optional, Dict, Any, Tuple
 
-from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.openapi.docs import get_swagger_ui_html
+from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
 
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
@@ -255,6 +257,9 @@ def create_api_app() -> FastAPI:
         title="Chest Bot API",
         description="API for accessing donation and leaderboard data.",
         version="1.0.0",
+        docs_url=None,       # Disable public /docs
+        redoc_url=None,      # Disable public /redoc
+        openapi_url=None,    # Disable public /openapi.json
     )
 
     # CORS
@@ -269,21 +274,27 @@ def create_api_app() -> FastAPI:
 
     @app.get("/")
     async def root():
-        """Root endpoint with API information."""
-        return {
-            "name": "Chest Bot API",
-            "version": "1.0.0",
-            "docs": "/docs",
-            "endpoints": {
-                "/api/v1/stats": "Overall statistics (total raised, breakdown by token, targets)",
-                "/api/v1/leaderboard": "Full donor leaderboard (same as Discord)",
-                "/api/v1/recent": "Recent donation transactions",
-            },
-        }
+        return {"status": "ok"}
 
     @app.get("/health")
     async def health():
         return {"status": "healthy"}
+
+    @app.get("/openapi.json", include_in_schema=False)
+    async def get_openapi(
+        x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
+        api_key_query: Optional[str] = Query(None, alias="X-API-Key"),
+    ):
+        _verify_api_key(x_api_key or api_key_query)
+        return JSONResponse(app.openapi())
+
+    @app.get("/docs", include_in_schema=False)
+    async def get_docs(x_api_key: Optional[str] = Header(None, alias="X-API-Key")):
+        _verify_api_key(x_api_key)
+        return get_swagger_ui_html(
+            openapi_url=f"/openapi.json?X-API-Key={x_api_key}",
+            title="Chest Bot API - Docs",
+        )
 
     @app.get("/api/v1/stats")
     async def get_stats(x_api_key: Optional[str] = Header(None, alias="X-API-Key")):
