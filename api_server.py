@@ -289,10 +289,14 @@ def create_api_app() -> FastAPI:
         return JSONResponse(app.openapi())
 
     @app.get("/docs", include_in_schema=False)
-    async def get_docs(x_api_key: Optional[str] = Header(None, alias="X-API-Key")):
-        _verify_api_key(x_api_key)
+    async def get_docs(
+        x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
+        key: Optional[str] = Query(None),
+    ):
+        resolved_key = x_api_key or key
+        _verify_api_key(resolved_key)
         return get_swagger_ui_html(
-            openapi_url=f"/openapi.json?X-API-Key={x_api_key}",
+            openapi_url=f"/openapi.json?X-API-Key={resolved_key}",
             title="Chest Bot API - Docs",
         )
 
