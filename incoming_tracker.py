@@ -87,7 +87,7 @@ class HeliusRPCClient:
                     raise RuntimeError(f"RPC Error: {result['error']}")
                 return result.get("result")
 
-            except aiohttp.ClientError:
+            except (aiohttp.ClientError, RuntimeError):
                 if attempt == MAX_RETRIES - 1:
                     raise
                 wait_time = RETRY_DELAY_BASE * (2 ** min(attempt, 4))
@@ -713,6 +713,7 @@ class IncomingTracker:
         self._last_accounts_refresh = 0.0
         self._cached_addresses: List[str] = []
         self.unlimited_backfill = False
+        self._last_known_prices: Dict[str, float] = {}
 
     async def _get_tracked_addresses(self) -> List[str]:
         now = time.time()
@@ -783,7 +784,7 @@ class IncomingTracker:
             _expire_otps(snapshot_conn)
             exchange_wallets = _load_exchange_wallets(snapshot_conn)
 
-            computed = await _compute_values_for_rows(rows, self.fartboy_mint)
+            computed = await _compute_values_for_rows(rows, self.fartboy_mint, self._last_known_prices)
             if not computed:
                 print("Price lookup failed; skipping donation updates this cycle.")
                 return len(rows), [], []
@@ -939,8 +940,14 @@ async def _fetch_coingecko_price_range(
     return payload.get("prices", [])
 
 
-async def _compute_values_for_rows(rows: List[Dict], fartboy_mint: str) -> List[Tuple[Dict, float, float]]:
+async def _compute_values_for_rows(
+    rows: List[Dict],
+    fartboy_mint: str,
+    last_known_prices: Optional[Dict[str, float]] = None,
+) -> List[Tuple[Dict, float, float]]:
     results: List[Tuple[Dict, float, float]] = []
+    if last_known_prices is None:
+        last_known_prices = {}
     async with aiohttp.ClientSession() as session:
         price_cache: Dict[str, float] = {}
         range_cache: Dict[str, List[List[float]]] = {}
@@ -961,23 +968,28 @@ async def _compute_values_for_rows(rows: List[Dict], fartboy_mint: str) -> List[
                 return []
             try:
                 prices = await _fetch_coingecko_price_range(session, mint, range_start, range_end)
-            except aiohttp.ClientError:
+            except Exception:
                 prices = []
             range_cache[mint] = prices
             return prices
+
         async def get_price(mint: str) -> float:
             if mint in price_cache:
                 return price_cache[mint]
             price = 0.0
             try:
                 price = await _fetch_jupiter_price_usdc(session, mint)
-            except aiohttp.ClientError:
+            except Exception:
                 price = 0.0
             if price <= 0:
                 try:
                     price = await _fetch_coingecko_price_usd(session, mint)
-                except aiohttp.ClientError:
+                except Exception:
                     price = 0.0
+            if price > 0:
+                last_known_prices[mint] = price
+            elif mint in last_known_prices:
+                price = last_known_prices[mint]
             price_cache[mint] = price
             return price
 
@@ -1008,7 +1020,6 @@ async def _compute_values_for_rows(rows: List[Dict], fartboy_mint: str) -> List[
 
             fartboy_price = await get_price_at(fartboy_mint, row.get("timestamp"))
             if fartboy_price <= 0:
-                # Skip pricing if we can't reach the price API.
                 continue
             value_usdc, value_fartboy = _calculate_values(
                 token, row["amount_ui"], fartboy_price, token_price
@@ -1079,9 +1090,14 @@ def main() -> None:
         asyncio.run(tracker.run_once())
         return
 
+    import logging as _logging
+    _log = _logging.getLogger("incoming_tracker")
     interval = max(5, args.interval)
     while True:
-        asyncio.run(tracker.run_once())
+        try:
+            asyncio.run(tracker.run_once())
+        except Exception as exc:
+            _log.exception("Tracker tick failed: %s", exc)
         time.sleep(interval)
 
 

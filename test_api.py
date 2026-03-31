@@ -29,11 +29,11 @@ RESET = "\033[0m"
 BOLD = "\033[1m"
 
 
-def pretty(data: dict) -> str:
+def pretty(data) -> str:
     return json.dumps(data, indent=2, ensure_ascii=False)
 
 
-def test_endpoint(path: str, auth: bool = True, params: dict | None = None):
+def test_endpoint(path: str, auth: bool = True, params: dict | None = None, expect_fail: bool = False):
     url = f"{BASE_URL}{path}"
     headers = {"X-API-Key": API_KEY} if auth else {}
 
@@ -41,27 +41,36 @@ def test_endpoint(path: str, auth: bool = True, params: dict | None = None):
     print(f"{BOLD}GET {url}{RESET}")
     if params:
         print(f"    params: {params}")
+    if expect_fail:
+        print(f"    {YELLOW}(expecting 401){RESET}")
     print(f"{CYAN}{'='*60}{RESET}")
 
     try:
         resp = requests.get(url, headers=headers, params=params, timeout=10)
     except requests.ConnectionError:
-        print(f"{RED}CONNECTION FAILED — is the bot running and the port open?{RESET}")
+        print(f"{RED}CONNECTION FAILED — is the bot running?{RESET}")
         return False
     except requests.Timeout:
         print(f"{RED}REQUEST TIMED OUT{RESET}")
         return False
 
-    status_color = GREEN if resp.status_code == 200 else RED
+    expected_status = 401 if expect_fail else 200
+    passed = resp.status_code == expected_status
+    status_color = GREEN if passed else RED
     print(f"Status: {status_color}{resp.status_code}{RESET}")
 
     try:
         data = resp.json()
         print(pretty(data))
     except Exception:
-        print(resp.text[:500])
+        # For HTML responses (like /docs), just show first 200 chars
+        text = resp.text[:200]
+        if resp.status_code == 200:
+            print(f"{GREEN}(HTML response, {len(resp.text)} bytes){RESET}")
+        else:
+            print(text)
 
-    return resp.status_code == 200
+    return passed
 
 
 def main():
@@ -71,7 +80,7 @@ def main():
 
     results = {}
 
-    # 1. Root (no auth)
+    # 1. Root (no auth) - should return minimal info
     results["/ (root)"] = test_endpoint("/", auth=False)
 
     # 2. Health (no auth)
@@ -86,9 +95,18 @@ def main():
     # 5. Recent transactions (auth required)
     results["/api/v1/recent"] = test_endpoint("/api/v1/recent", params={"limit": 5})
 
-    # 6. Test auth rejection (no key should fail)
-    print(f"\n{BOLD}{YELLOW}--- Testing auth rejection (no key) ---{RESET}")
-    results["auth rejection"] = not test_endpoint("/api/v1/stats", auth=False)
+    # 6. Docs WITH key (via query param) - should work
+    print(f"\n{BOLD}{YELLOW}--- Testing /docs access ---{RESET}")
+    results["/docs (with key)"] = test_endpoint("/docs", auth=False, params={"key": API_KEY})
+
+    # 7. Docs WITHOUT key - should be rejected
+    results["/docs (no key)"] = test_endpoint("/docs", auth=False, expect_fail=True)
+
+    # 8. /openapi.json WITHOUT key - should be rejected
+    results["/openapi.json (no key)"] = test_endpoint("/openapi.json", auth=False, expect_fail=True)
+
+    # 9. Stats without key - should be rejected
+    results["auth rejection (no key)"] = test_endpoint("/api/v1/stats", auth=False, expect_fail=True)
 
     # Summary
     print(f"\n{BOLD}{'='*60}{RESET}")

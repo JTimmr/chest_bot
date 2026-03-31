@@ -1834,7 +1834,10 @@ class LeaderboardBot(commands.Bot):
 
     @tasks.loop(seconds=UPDATE_SECONDS)
     async def update_leaderboard(self) -> None:
-        await self._refresh_leaderboards()
+        try:
+            await self._refresh_leaderboards()
+        except Exception as exc:
+            log.exception("Leaderboard refresh failed: %s", exc)
 
     async def _refresh_leaderboards(self) -> None:
         now_ts = time.time()
@@ -1850,7 +1853,7 @@ class LeaderboardBot(commands.Bot):
                 continue
             try:
                 msg = await channel.fetch_message(message_id)
-            except discord.NotFound:
+            except discord.HTTPException:
                 continue
             try:
                 if leaderboard_type == "donations":
@@ -1872,9 +1875,12 @@ class LeaderboardBot(commands.Bot):
             mtime = os.path.getmtime(SNAPSHOT_DB)
         except OSError:
             return
-        if mtime > self._last_snapshot_mtime:
-            self._last_snapshot_mtime = mtime
-            await self._refresh_leaderboards()
+        try:
+            if mtime > self._last_snapshot_mtime:
+                self._last_snapshot_mtime = mtime
+                await self._refresh_leaderboards()
+        except Exception as exc:
+            log.exception("Snapshot-triggered refresh failed: %s", exc)
 
     @tasks.loop(seconds=TRACKER_INTERVAL_SECONDS)
     async def track_incoming(self) -> None:
