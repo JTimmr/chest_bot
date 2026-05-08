@@ -1985,7 +1985,7 @@ class VerificationButtonsView(discord.ui.View):
 
     @discord.ui.button(
         label="Become anonymous",
-        style=discord.ButtonStyle.secondary,
+        style=discord.ButtonStyle.danger,
         custom_id="become_anonymous_button",
         row=2,
     )
@@ -2124,7 +2124,7 @@ class VerificationButtonsDMView(discord.ui.View):
 
     @discord.ui.button(
         label="Become anonymous",
-        style=discord.ButtonStyle.secondary,
+        style=discord.ButtonStyle.danger,
         custom_id="become_anonymous_button_dm",
         row=2,
     )
