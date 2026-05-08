@@ -5,6 +5,7 @@ Discord bot: maintains a permanent donation leaderboard message.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import sqlite3
@@ -397,6 +398,343 @@ def _fetch_next_target(total_raised: float) -> Dict | None:
     except sqlite3.Error as exc:
         log.error("Failed to fetch next target: %s", exc)
         return None
+
+
+def _ensure_donation_tiers_schema() -> None:
+    try:
+        with _connect_db(STATE_DB) as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS donation_tiers (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    min_usd REAL NOT NULL,
+                    emoji TEXT NOT NULL,
+                    role_name TEXT NOT NULL,
+                    order_index INTEGER NOT NULL DEFAULT 0,
+                    is_active INTEGER NOT NULL DEFAULT 1
+                )
+                """
+            )
+            conn.commit()
+    except sqlite3.Error as exc:
+        log.error("Failed to ensure donation_tiers schema: %s", exc)
+
+
+def _ensure_donor_config_schema() -> None:
+    try:
+        with _connect_db(STATE_DB) as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS donor_config (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )
+                """
+            )
+            conn.commit()
+    except sqlite3.Error as exc:
+        log.error("Failed to ensure donor_config schema: %s", exc)
+
+
+def _get_donor_config(key: str) -> str | None:
+    try:
+        with _connect_db(STATE_DB) as conn:
+            row = conn.execute(
+                "SELECT value FROM donor_config WHERE key = ?", (key,)
+            ).fetchone()
+        return row[0] if row else None
+    except sqlite3.Error as exc:
+        log.error("Failed to read donor_config key %s: %s", key, exc)
+        return None
+
+
+def _set_donor_config(key: str, value: str) -> bool:
+    try:
+        with _connect_db(STATE_DB) as conn:
+            conn.execute(
+                """
+                INSERT INTO donor_config (key, value) VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                (key, value),
+            )
+            conn.commit()
+        return True
+    except sqlite3.Error as exc:
+        log.error("Failed to set donor_config key %s: %s", key, exc)
+        return False
+
+
+def _add_tier(min_usd: float, emoji: str, role_name: str) -> int | None:
+    try:
+        with _connect_db(STATE_DB) as conn:
+            row = conn.execute(
+                "SELECT MAX(order_index) FROM donation_tiers"
+            ).fetchone()
+            next_order = int(row[0] or 0) + 1 if row and row[0] is not None else 1
+            cur = conn.execute(
+                """
+                INSERT INTO donation_tiers (min_usd, emoji, role_name, order_index, is_active)
+                VALUES (?, ?, ?, ?, 1)
+                """,
+                (min_usd, emoji, role_name, next_order),
+            )
+            conn.commit()
+            return cur.lastrowid
+    except sqlite3.Error as exc:
+        log.error("Failed to add tier: %s", exc)
+        return None
+
+
+def _remove_tier(tier_id: int) -> bool:
+    try:
+        with _connect_db(STATE_DB) as conn:
+            cur = conn.execute(
+                "UPDATE donation_tiers SET is_active = 0 WHERE id = ?",
+                (tier_id,),
+            )
+            conn.commit()
+            return cur.rowcount > 0
+    except sqlite3.Error as exc:
+        log.error("Failed to remove tier: %s", exc)
+        return False
+
+
+def _fetch_tiers() -> List[Dict]:
+    try:
+        with _connect_db(STATE_DB) as conn:
+            rows = conn.execute(
+                """
+                SELECT id, min_usd, emoji, role_name, order_index
+                FROM donation_tiers
+                WHERE is_active = 1
+                ORDER BY min_usd ASC
+                """
+            ).fetchall()
+        return [
+            {
+                "id": r[0],
+                "min_usd": float(r[1]),
+                "emoji": r[2],
+                "role_name": r[3],
+                "order_index": r[4],
+            }
+            for r in rows
+        ]
+    except sqlite3.Error as exc:
+        log.error("Failed to fetch tiers: %s", exc)
+        return []
+
+
+def _check_base_eligibility(discord_id: str) -> bool:
+    """Check if a verified user qualifies for the base donor tier.
+
+    Eligible if any linked wallet donated >= 1% of snapshot holdings,
+    or if user has no snapshot holdings and total_donated_usd >= $50.
+    """
+    try:
+        with _connect_db(SNAPSHOT_DB) as conn:
+            wallets = conn.execute(
+                f"""
+                SELECT wallet_address, amount_fartboy, donated_fartboy
+                FROM {SNAPSHOT_TABLE}
+                WHERE discord_id = ?
+                """,
+                (discord_id,),
+            ).fetchall()
+            if not wallets:
+                return False
+
+            summary = conn.execute(
+                f"""
+                SELECT total_donated_usd
+                FROM {SUMMARY_TABLE}
+                WHERE discord_id = ?
+                """,
+                (discord_id,),
+            ).fetchone()
+            total_donated_usd = float(summary[0] or 0) if summary else 0.0
+
+            has_snapshot_holdings = False
+            for _wallet, amount_fartboy, donated_fartboy in wallets:
+                amount = float(amount_fartboy or 0)
+                donated = float(donated_fartboy or 0)
+                if amount > 0:
+                    has_snapshot_holdings = True
+                    if donated >= amount * 0.01:
+                        return True
+
+            if not has_snapshot_holdings:
+                return total_donated_usd >= 50.0
+
+            return False
+    except sqlite3.Error as exc:
+        log.error("Failed to check base eligibility for %s: %s", discord_id, exc)
+        return False
+
+
+def _get_user_donated_usd(discord_id: str) -> float:
+    try:
+        with _connect_db(SNAPSHOT_DB) as conn:
+            row = conn.execute(
+                f"SELECT total_donated_usd FROM {SUMMARY_TABLE} WHERE discord_id = ?",
+                (discord_id,),
+            ).fetchone()
+        return float(row[0] or 0) if row else 0.0
+    except sqlite3.Error as exc:
+        log.error("Failed to get donated usd for %s: %s", discord_id, exc)
+        return 0.0
+
+
+def _all_tier_emojis() -> List[str]:
+    return [t["emoji"] for t in _fetch_tiers()]
+
+
+def _strip_tier_emoji(name: str, known_emojis: List[str]) -> str:
+    """Remove any known tier emoji prefix from a display name."""
+    stripped = name
+    for emoji in known_emojis:
+        if stripped.startswith(emoji + " "):
+            stripped = stripped[len(emoji) + 1:]
+        elif stripped.startswith(emoji):
+            stripped = stripped[len(emoji):]
+    return stripped.strip()
+
+
+def _build_tier_nickname(base_name: str, emoji: str | None, known_emojis: List[str]) -> str:
+    clean = _strip_tier_emoji(base_name, known_emojis)
+    if not emoji:
+        return clean[:32]
+    candidate = f"{emoji} {clean}"
+    if len(candidate) > 32:
+        max_name = 32 - len(emoji) - 1
+        candidate = f"{emoji} {clean[:max_name]}"
+    return candidate
+
+
+async def sync_donor_roles(guild: discord.Guild) -> None:
+    """Sync donor roles and nickname emojis for all verified users."""
+    tiers = _fetch_tiers()
+    base_role_name = _get_donor_config("base_role_name")
+    if not tiers or not base_role_name:
+        return
+
+    tiers_desc = sorted(tiers, key=lambda t: t["min_usd"], reverse=True)
+    all_role_names = {base_role_name} | {t["role_name"] for t in tiers}
+    known_emojis = [t["emoji"] for t in tiers]
+
+    role_map: Dict[str, discord.Role] = {}
+    for rn in all_role_names:
+        existing = discord.utils.get(guild.roles, name=rn)
+        if existing:
+            role_map[rn] = existing
+        else:
+            try:
+                new_role = await guild.create_role(name=rn, reason="Donor tier auto-created")
+                role_map[rn] = new_role
+            except discord.HTTPException as exc:
+                log.warning("Failed to create role %s: %s", rn, exc)
+
+    base_role = role_map.get(base_role_name)
+    if not base_role:
+        log.warning("Base donor role '%s' could not be resolved; skipping sync.", base_role_name)
+        return
+
+    tier_roles = set()
+    for t in tiers:
+        r = role_map.get(t["role_name"])
+        if r:
+            tier_roles.add(r)
+
+    try:
+        with _connect_db(SNAPSHOT_DB) as conn:
+            users = conn.execute(
+                f"SELECT discord_id, total_donated_usd FROM {SUMMARY_TABLE} WHERE discord_id IS NOT NULL"
+            ).fetchall()
+    except sqlite3.Error as exc:
+        log.error("Failed to load verified users for role sync: %s", exc)
+        return
+
+    ranked = sorted(users, key=lambda u: float(u[1] or 0), reverse=True)
+    top5_ids = {str(u[0]) for u in ranked[:5] if float(u[1] or 0) > 0}
+
+    for discord_id, total_donated_usd in users:
+        discord_id = str(discord_id)
+        donated_usd = float(total_donated_usd or 0)
+
+        if not _check_base_eligibility(discord_id):
+            continue
+
+        if discord_id in top5_ids and tiers_desc:
+            target_tier = tiers_desc[0]
+        else:
+            target_tier = None
+            for t in tiers_desc:
+                if donated_usd >= t["min_usd"]:
+                    target_tier = t
+                    break
+
+        if not target_tier:
+            continue
+
+        target_tier_role = role_map.get(target_tier["role_name"])
+        if not target_tier_role:
+            continue
+
+        try:
+            member = guild.get_member(int(discord_id))
+            if not member:
+                try:
+                    member = await guild.fetch_member(int(discord_id))
+                except discord.HTTPException:
+                    continue
+        except (ValueError, discord.HTTPException):
+            continue
+
+        roles_to_add = set()
+        roles_to_remove = set()
+
+        if base_role not in member.roles:
+            roles_to_add.add(base_role)
+        if target_tier_role not in member.roles:
+            roles_to_add.add(target_tier_role)
+
+        for tr in tier_roles:
+            if tr != target_tier_role and tr in member.roles:
+                roles_to_remove.add(tr)
+
+        try:
+            if roles_to_remove:
+                await member.remove_roles(*roles_to_remove, reason="Donor tier update")
+            if roles_to_add:
+                await member.add_roles(*roles_to_add, reason="Donor tier update")
+        except discord.HTTPException as exc:
+            log.warning("Failed to update roles for %s: %s", discord_id, exc)
+
+        target_nick = _build_tier_nickname(
+            member.display_name, target_tier["emoji"], known_emojis
+        )
+        if member.nick != target_nick:
+            try:
+                await member.edit(nick=target_nick, reason="Donor tier emoji")
+            except discord.HTTPException as exc:
+                log.warning("Failed to set nickname for %s: %s", discord_id, exc)
+
+        try:
+            with _connect_db(SNAPSHOT_DB) as conn:
+                conn.execute(
+                    f"""
+                    UPDATE {SUMMARY_TABLE}
+                    SET roles = ?
+                    WHERE discord_id = ?
+                    """,
+                    (f"{base_role_name},{target_tier['role_name']}", discord_id),
+                )
+                conn.commit()
+        except sqlite3.Error:
+            pass
+
+        await asyncio.sleep(0.5)
 
 
 def _fetch_total_by_token() -> Dict[str, float]:
@@ -1581,11 +1919,7 @@ class VerificationButtonsView(discord.ui.View):
     async def verify_wallet_button(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ):
-        await interaction.response.send_message(
-            "To verify your wallet, run `/verifywallet` here. "
-            "This is private and only visible to you.",
-            ephemeral=True,
-        )
+        await verify_wallet_otp.callback(interaction)
 
     @discord.ui.button(
         label="Verify status",
@@ -1621,24 +1955,68 @@ class VerificationButtonsView(discord.ui.View):
         await my_transactions.callback(interaction)
 
     @discord.ui.button(
-        label="Leaderboard visibility",
-        style=discord.ButtonStyle.secondary,
-        custom_id="leaderboard_visibility_button",
+        label="Become visible",
+        style=discord.ButtonStyle.success,
+        custom_id="become_visible_button",
         row=2,
     )
-    async def leaderboard_visibility_button(
+    async def become_visible_button(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ):
+        discord_id = str(interaction.user.id)
+        if not _find_wallets_for_discord_id(discord_id):
+            return await interaction.response.send_message(
+                "No verified wallet found. Use the Verify wallet button first.",
+                ephemeral=True,
+            )
+        if _is_leaderboard_visible(discord_id):
+            return await interaction.response.send_message(
+                "You are already visible on the leaderboard.",
+                ephemeral=True,
+            )
+        _update_visibility_by_discord(discord_id, str(interaction.user), 1)
+        _set_summary_visibility(discord_id, 1)
+        _recompute_summary_for_discord_id(discord_id)
         await interaction.response.send_message(
-            "To change your leaderboard visibility, run `/leaderboardvisibility` here.",
+            "Your name is now **visible** on the leaderboard. You can change this anytime.",
             ephemeral=True,
         )
+        await bot._refresh_leaderboards()
+
+    @discord.ui.button(
+        label="Become anonymous",
+        style=discord.ButtonStyle.secondary,
+        custom_id="become_anonymous_button",
+        row=2,
+    )
+    async def become_anonymous_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        discord_id = str(interaction.user.id)
+        if not _find_wallets_for_discord_id(discord_id):
+            return await interaction.response.send_message(
+                "No verified wallet found. Use the Verify wallet button first.",
+                ephemeral=True,
+            )
+        if not _is_leaderboard_visible(discord_id):
+            return await interaction.response.send_message(
+                "You are already anonymous on the leaderboard.",
+                ephemeral=True,
+            )
+        _update_visibility_by_discord(discord_id, str(interaction.user), 0)
+        _set_summary_visibility(discord_id, 0)
+        _recompute_summary_for_discord_id(discord_id)
+        await interaction.response.send_message(
+            "You are now **anonymous** on the leaderboard. Your donations show as 'Anonymous donor'.",
+            ephemeral=True,
+        )
+        await bot._refresh_leaderboards()
 
     @discord.ui.button(
         label="Full leaderboard",
         style=discord.ButtonStyle.secondary,
         custom_id="full_leaderboard_button",
-        row=2,
+        row=3,
     )
     async def full_leaderboard_button(
         self, interaction: discord.Interaction, button: discord.ui.Button
@@ -1649,7 +2027,7 @@ class VerificationButtonsView(discord.ui.View):
         label="Open DM",
         style=discord.ButtonStyle.secondary,
         custom_id="open_dm_button",
-        row=3,
+        row=4,
     )
     async def open_dm_button(
         self, interaction: discord.Interaction, button: discord.ui.Button
@@ -1680,11 +2058,7 @@ class VerificationButtonsDMView(discord.ui.View):
     async def verify_wallet_button(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ):
-        await interaction.response.send_message(
-            "To verify your wallet, run `/verifywallet` here. "
-            "This is private and only visible to you.",
-            ephemeral=True,
-        )
+        await verify_wallet_otp.callback(interaction)
 
     @discord.ui.button(
         label="Verify status",
@@ -1720,24 +2094,68 @@ class VerificationButtonsDMView(discord.ui.View):
         await my_transactions.callback(interaction)
 
     @discord.ui.button(
-        label="Leaderboard visibility",
-        style=discord.ButtonStyle.secondary,
-        custom_id="leaderboard_visibility_button_dm",
+        label="Become visible",
+        style=discord.ButtonStyle.success,
+        custom_id="become_visible_button_dm",
         row=2,
     )
-    async def leaderboard_visibility_button(
+    async def become_visible_button(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ):
+        discord_id = str(interaction.user.id)
+        if not _find_wallets_for_discord_id(discord_id):
+            return await interaction.response.send_message(
+                "No verified wallet found. Use the Verify wallet button first.",
+                ephemeral=True,
+            )
+        if _is_leaderboard_visible(discord_id):
+            return await interaction.response.send_message(
+                "You are already visible on the leaderboard.",
+                ephemeral=True,
+            )
+        _update_visibility_by_discord(discord_id, str(interaction.user), 1)
+        _set_summary_visibility(discord_id, 1)
+        _recompute_summary_for_discord_id(discord_id)
         await interaction.response.send_message(
-            "To change your leaderboard visibility, run `/leaderboardvisibility` here.",
+            "Your name is now **visible** on the leaderboard. You can change this anytime.",
             ephemeral=True,
         )
+        await bot._refresh_leaderboards()
+
+    @discord.ui.button(
+        label="Become anonymous",
+        style=discord.ButtonStyle.secondary,
+        custom_id="become_anonymous_button_dm",
+        row=2,
+    )
+    async def become_anonymous_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        discord_id = str(interaction.user.id)
+        if not _find_wallets_for_discord_id(discord_id):
+            return await interaction.response.send_message(
+                "No verified wallet found. Use the Verify wallet button first.",
+                ephemeral=True,
+            )
+        if not _is_leaderboard_visible(discord_id):
+            return await interaction.response.send_message(
+                "You are already anonymous on the leaderboard.",
+                ephemeral=True,
+            )
+        _update_visibility_by_discord(discord_id, str(interaction.user), 0)
+        _set_summary_visibility(discord_id, 0)
+        _recompute_summary_for_discord_id(discord_id)
+        await interaction.response.send_message(
+            "You are now **anonymous** on the leaderboard. Your donations show as 'Anonymous donor'.",
+            ephemeral=True,
+        )
+        await bot._refresh_leaderboards()
 
     @discord.ui.button(
         label="Full leaderboard",
         style=discord.ButtonStyle.secondary,
         custom_id="full_leaderboard_button_dm",
-        row=2,
+        row=3,
     )
     async def full_leaderboard_button(
         self, interaction: discord.Interaction, button: discord.ui.Button
@@ -1765,6 +2183,8 @@ class LeaderboardBot(commands.Bot):
         _ensure_otp_schema()
         _ensure_exchange_wallets_schema()
         _ensure_targets_schema()
+        _ensure_donation_tiers_schema()
+        _ensure_donor_config_schema()
         self.add_view(VerificationButtonsView())
         if not self._tracker:
             api_key = os.getenv("HELIUS_API_KEY")
@@ -1918,6 +2338,10 @@ class LeaderboardBot(commands.Bot):
                             await _send_dm_with_intro(user, dm_message)
                     except discord.HTTPException:
                         log.warning("Failed to DM verification for discord id %s", did)
+            if count > 0 and GUILD_ID:
+                guild = self.get_guild(int(GUILD_ID))
+                if guild:
+                    await sync_donor_roles(guild)
             log.info("Tracker tick complete. New transactions: %s", count)
         except Exception as exc:
             log.exception("Tracker tick failed: %s", exc)
@@ -2479,6 +2903,51 @@ _COMMAND_HELP: Dict[str, Dict[str, str]] = {
         "usage": "`!targets`",
         "details": "Displays each target with current progress in USD and percentage.",
     },
+    "setbaserole": {
+        "summary": "Set the base contributor role for qualifying donors.",
+        "usage": "`!setbaserole <role_name>`",
+        "details": (
+            "Every donor who qualifies for any tier receives this role.\n"
+            "Example: `!setbaserole Contributor`\n"
+            "The role is created automatically if it doesn't exist."
+        ),
+    },
+    "settier": {
+        "summary": "Add a donation tier with emoji and role.",
+        "usage": "`!settier <min_usd> <emoji> <role_name>`",
+        "details": (
+            "Creates a tier at the given USD threshold. Donors at or above this amount "
+            "get the emoji as a nickname prefix and the role assigned.\n"
+            "Examples:\n"
+            "  `!settier 50 \U0001f949 Bronze Donor`\n"
+            "  `!settier 100 \U0001f948 Silver Donor`\n"
+            "  `!settier 500 \U0001f451 Gold Donor`\n"
+            "Only the highest qualifying tier's emoji and role are applied.\n"
+            "Top 5 donors automatically get the highest tier."
+        ),
+    },
+    "removetier": {
+        "summary": "Remove a donation tier by ID.",
+        "usage": "`!removetier <id>`",
+        "details": "Use `!tiers` to see tier IDs.",
+    },
+    "tiers": {
+        "summary": "Show all active donation tiers and the base role.",
+        "usage": "`!tiers`",
+        "details": (
+            "Displays the base role, all tier thresholds with their emoji and role name, "
+            "and notes that top 5 donors receive the highest tier automatically."
+        ),
+    },
+    "syncdonorroles": {
+        "summary": "Force a full donor role and nickname sync.",
+        "usage": "`!syncdonorroles`",
+        "details": (
+            "Re-evaluates every verified user against the configured tiers and updates "
+            "their Discord roles and nickname emoji prefix. Normally this runs automatically "
+            "after each tracker cycle, but this command triggers it manually."
+        ),
+    },
 }
 
 
@@ -2545,6 +3014,13 @@ def _build_help_embed(command_name: Optional[str]) -> discord.Embed:
             "removetarget",
             "targets",
         ],
+        "Donor Tiers": [
+            "setbaserole",
+            "settier",
+            "removetier",
+            "tiers",
+            "syncdonorroles",
+        ],
         "Admin utilities": [
             "settrackerinterval",
             "setpagelimit",
@@ -2573,7 +3049,11 @@ def _build_help_embed(command_name: Optional[str]) -> discord.Embed:
         value=(
             "1) `!snapshotholders`\n"
             "2) `!setdonationleaderboard #channel [limit]`\n"
-            "3) `!golive`"
+            "3) `!golive`\n\n"
+            "**Optional — donor tiers (after go-live):**\n"
+            "4) `!setbaserole Contributor`\n"
+            "5) `!settier 50 \U0001f949 Bronze Donor` (repeat for each tier)\n"
+            "6) `!syncdonorroles` (force first sync)"
         ),
         inline=False,
     )
@@ -3007,6 +3487,114 @@ async def target_error(ctx: commands.Context, error: Exception):
     else:
         log.exception("Target command error: %s", error)
         await ctx.send("Failed to execute target command. Check logs.")
+
+
+@bot.command(name="setbaserole")
+@commands.has_permissions(manage_guild=True)
+async def setbaserole(ctx: commands.Context, *, role_name: str = ""):
+    """Set the base contributor role given to all qualifying donors."""
+    if not role_name.strip():
+        return await ctx.send("Usage: `!setbaserole <role_name>`\nExample: `!setbaserole Contributor`")
+    success = _set_donor_config("base_role_name", role_name.strip())
+    if success:
+        await ctx.send(f"Base donor role set to **{role_name.strip()}**.")
+    else:
+        await ctx.send("Failed to set base role. Check logs.")
+
+
+@bot.command(name="settier")
+@commands.has_permissions(manage_guild=True)
+async def settier(ctx: commands.Context, min_usd: str = "", emoji: str = "", *, role_name: str = ""):
+    """Add a donation tier. Usage: !settier <min_usd> <emoji> <role_name>"""
+    if not min_usd or not emoji or not role_name.strip():
+        return await ctx.send(
+            "Usage: `!settier <min_usd> <emoji> <role_name>`\n"
+            "Example: `!settier 100 \U0001f396 Silver Donor`"
+        )
+    try:
+        amount = float(min_usd.replace(",", "").replace("$", ""))
+        if amount < 0:
+            return await ctx.send("Minimum USD must be zero or positive.")
+    except ValueError:
+        return await ctx.send("Invalid amount. Use a number like `100` or `250.00`.")
+    tier_id = _add_tier(amount, emoji.strip(), role_name.strip())
+    if tier_id is None:
+        return await ctx.send("Failed to add tier. Check logs.")
+    await ctx.send(
+        f"Tier #{tier_id} added: **${amount:,.2f}** — {emoji.strip()} **{role_name.strip()}**"
+    )
+
+
+@bot.command(name="removetier")
+@commands.has_permissions(manage_guild=True)
+async def removetier(ctx: commands.Context, tier_id: str = ""):
+    """Remove a donation tier by ID. Usage: !removetier <id>"""
+    if not tier_id:
+        return await ctx.send("Usage: `!removetier <id>`\nUse `!tiers` to see all tiers and their IDs.")
+    try:
+        tid = int(tier_id)
+    except ValueError:
+        return await ctx.send("Tier ID must be a number.")
+    success = _remove_tier(tid)
+    if success:
+        await ctx.send(f"Tier #{tid} removed.")
+    else:
+        await ctx.send(f"Tier #{tid} not found or already removed.")
+
+
+@bot.command(name="tiers")
+async def tiers_cmd(ctx: commands.Context):
+    """Show all active donation tiers."""
+    tiers = _fetch_tiers()
+    base_role = _get_donor_config("base_role_name")
+
+    lines = []
+    if base_role:
+        lines.append(f"**Base role:** {base_role} (given to all qualifying donors)")
+    else:
+        lines.append("**Base role:** Not set. Use `!setbaserole <name>` to configure.")
+
+    if not tiers:
+        lines.append("\nNo donation tiers configured. Use `!settier <min_usd> <emoji> <role_name>` to add one.")
+    else:
+        lines.append("\n**Tiers** (ascending by minimum donation):")
+        for t in tiers:
+            lines.append(
+                f"#{t['id']}: **${t['min_usd']:,.2f}** — {t['emoji']} **{t['role_name']}**"
+            )
+        lines.append("\nTop 5 donors automatically receive the highest tier role and emoji.")
+
+    await ctx.send("\n".join(lines))
+
+
+@bot.command(name="syncdonorroles")
+@commands.has_permissions(manage_guild=True)
+async def syncdonorroles(ctx: commands.Context):
+    """Force a full donor role and nickname sync for all verified users."""
+    if not GUILD_ID:
+        return await ctx.send("DISCORD_GUILD_ID not configured.")
+    guild = bot.get_guild(int(GUILD_ID))
+    if not guild:
+        return await ctx.send("Could not find the configured guild.")
+    await ctx.send("Starting donor role sync...")
+    try:
+        await sync_donor_roles(guild)
+        await ctx.send("Donor role sync complete.")
+    except Exception as exc:
+        log.exception("Manual donor role sync failed: %s", exc)
+        await ctx.send(f"Sync failed: {exc}")
+
+
+@setbaserole.error
+@settier.error
+@removetier.error
+@syncdonorroles.error
+async def tier_cmd_error(ctx: commands.Context, error: Exception):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("You need **Manage Server** to run this.")
+    else:
+        log.exception("Tier command error: %s", error)
+        await ctx.send("Failed to execute tier command. Check logs.")
 
 
 def main() -> None:
