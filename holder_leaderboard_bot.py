@@ -1189,7 +1189,14 @@ def _discord_id_for_wallet(wallet: str) -> str | None:
 
 
 def _recompute_summary_for_discord_id(discord_id: str) -> None:
+    """Rebuild SUMMARY_TABLE row from verified snapshot wallets plus tx-only attribution.
+
+    Donations from senders verified to this user are counted via snapshot donated_usd.
+    Additional rows in the tx table with this discord_id but sender not in that wallet set
+    (e.g. exchange hot wallets linked via !addtransaction) are summed so totals stay correct.
+    """
     try:
+        wallets: List[Tuple] = []
         with _connect_db(SNAPSHOT_DB) as conn:
             wallets = conn.execute(
                 f"""
@@ -1199,12 +1206,55 @@ def _recompute_summary_for_discord_id(discord_id: str) -> None:
                 """,
                 (discord_id,),
             ).fetchall()
+
+        verified_wallets = {str(r[0]) for r in wallets if r and r[0]}
+        extra_usd = 0.0
+        try:
+            with _connect_db(TX_DB) as tx_conn:
+                if verified_wallets:
+                    placeholders = ",".join("?" * len(verified_wallets))
+                    row = tx_conn.execute(
+                        f"""
+                        SELECT COALESCE(SUM(value_usdc), 0)
+                        FROM {TX_TABLE}
+                        WHERE discord_id = ?
+                          AND sender_wallet NOT IN ({placeholders})
+                        """,
+                        (discord_id, *verified_wallets),
+                    ).fetchone()
+                else:
+                    row = tx_conn.execute(
+                        f"""
+                        SELECT COALESCE(SUM(value_usdc), 0)
+                        FROM {TX_TABLE}
+                        WHERE discord_id = ?
+                        """,
+                        (discord_id,),
+                    ).fetchone()
+                extra_usd = float(row[0] or 0) if row else 0.0
+        except sqlite3.Error as exc:
+            log.error("Failed to sum attributed txs for summary: %s", exc)
+            extra_usd = 0.0
+
+        with _connect_db(SNAPSHOT_DB) as conn:
             if not wallets:
-                return
-            total_holdings = sum(float(r[1] or 0) for r in wallets)
-            total_donated_usd = sum(float(r[2] or 0) for r in wallets)
-            discord_name = next((r[3] for r in wallets if r[3]), None)
-            wallet_list = ",".join(sorted({r[0] for r in wallets if r[0]}))
+                if extra_usd <= 0:
+                    return
+                total_holdings = 0.0
+                total_donated_snapshot = 0.0
+                name_row = conn.execute(
+                    f"SELECT discord_name FROM {SUMMARY_TABLE} WHERE discord_id = ?",
+                    (discord_id,),
+                ).fetchone()
+                discord_name = name_row[0] if name_row and name_row[0] else None
+                wallet_list = ""
+            else:
+                total_holdings = sum(float(r[1] or 0) for r in wallets)
+                total_donated_snapshot = sum(float(r[2] or 0) for r in wallets)
+                discord_name = next((r[3] for r in wallets if r[3]), None)
+                wallet_list = ",".join(sorted({str(r[0]) for r in wallets if r[0]}))
+
+            total_donated_usd = total_donated_snapshot + extra_usd
 
             existing = conn.execute(
                 f"""
@@ -1445,6 +1495,7 @@ async def _process_signature(signature: str, discord_id: str | None = None) -> T
         computed = []
 
     inserted = 0
+    attribution_discord_id = discord_id
     exchange_wallets = _get_exchange_wallets()
     with sqlite3.connect(TX_DB) as tx_conn, sqlite3.connect(SNAPSHOT_DB) as snapshot_conn:
         _init_transactions_db(tx_conn, TX_TABLE)
@@ -1452,11 +1503,10 @@ async def _process_signature(signature: str, discord_id: str | None = None) -> T
         _ensure_otp_registry(snapshot_conn)
         _expire_otps(snapshot_conn)
         for row, value_usdc, value_fartboy in computed:
-            row_discord_id = (
-                discord_id
-                if discord_id and row.get("sender_wallet") not in exchange_wallets
-                else None
-            )
+            # When @user is passed to !addtransaction, always set tx.discord_id (including
+            # exchange senders). This does not verify the wallet on the snapshot; OTP still
+            # skips exchange wallets so snapshot discord_id is never set from them here.
+            row_discord_id = discord_id if discord_id else None
             cur = tx_conn.cursor()
             cur.execute(
                 f"""
@@ -1528,7 +1578,7 @@ async def _process_signature(signature: str, discord_id: str | None = None) -> T
                     row["sender_wallet"],
                 )
                 if matched:
-                    discord_id, discord_name = matched
+                    otp_discord_id, otp_discord_name = matched
                     snapshot_conn.execute(
                         f"""
                         UPDATE {SNAPSHOT_TABLE}
@@ -1536,10 +1586,10 @@ async def _process_signature(signature: str, discord_id: str | None = None) -> T
                         WHERE wallet_address = ?
                           AND (discord_id IS NULL OR discord_id = ?)
                         """,
-                        (discord_id, discord_name, row["sender_wallet"], discord_id),
+                        (otp_discord_id, otp_discord_name, row["sender_wallet"], otp_discord_id),
                     )
                     snapshot_conn.commit()
-                    _recompute_summary_for_discord_id(discord_id)
+                    _recompute_summary_for_discord_id(otp_discord_id)
                 else:
                     _record_used_otp(
                         snapshot_conn,
@@ -1548,6 +1598,8 @@ async def _process_signature(signature: str, discord_id: str | None = None) -> T
                         row["signature"],
                         row["sender_wallet"],
                     )
+    if attribution_discord_id:
+        _recompute_summary_for_discord_id(attribution_discord_id)
     return len(rows), inserted
 
 
@@ -2846,7 +2898,11 @@ _COMMAND_HELP: Dict[str, Dict[str, str]] = {
     "setexchangewallets": {
         "summary": "Mark wallets as exchange wallets.",
         "usage": "`!setexchangewallets EXCHANGE_NAME WALLET1 WALLET2 ...`",
-        "details": "Exchange wallets are excluded from perks and verification.",
+        "details": (
+            "Exchange wallets cannot be OTP-verified or !manualverify'd; use "
+            "`!addtransaction SIG @user` to attribute a specific donation. "
+            "They stay excluded from the public wallet leaderboard column."
+        ),
     },
     "removeexchangewallets": {
         "summary": "Remove wallets from the exchange list.",
@@ -2881,7 +2937,12 @@ _COMMAND_HELP: Dict[str, Dict[str, str]] = {
     "addtransaction": {
         "summary": "Manually record a transaction signature.",
         "usage": "`!addtransaction SIGNATURE [@user]`",
-        "details": "Optional @user links the donation to that user (including exchange sends).",
+        "details": (
+            "Optional @user sets discord_id on each incoming leg of that signature in the tx DB "
+            "(including sends from exchange-marked wallets). This attributes the donation to the "
+            "user for summaries and lookups; it does not verify an exchange wallet to that user "
+            "(snapshot discord_id / OTP are unchanged for exchange senders)."
+        ),
     },
     "donationbothelp": {
         "summary": "Legacy help command.",
@@ -3397,9 +3458,15 @@ async def addtransaction(ctx: commands.Context, signature: str = ""):
     total, inserted = await _process_signature(signature.strip(), discord_id=discord_id)
     if total == 0:
         return await ctx.send("No incoming transfers for the war chest found in that signature.")
-    if inserted == 0:
+    if inserted == 0 and not discord_id:
         return await ctx.send("Transaction already recorded or pricing unavailable.")
-    await ctx.send(f"Recorded {inserted} incoming transfer(s) from that signature.")
+    await bot._refresh_leaderboards()
+    if inserted > 0:
+        await ctx.send(f"Recorded {inserted} incoming transfer(s) from that signature.")
+    else:
+        await ctx.send(
+            "Transaction was already in the database; Discord attribution on those rows was updated."
+        )
 
 
 @setdonationleaderboard.error

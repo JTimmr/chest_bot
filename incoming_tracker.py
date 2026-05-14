@@ -569,21 +569,73 @@ def _match_assigned_otp(
     return row[0], row[1] or ""
 
 
-def _recompute_summary_for_discord_id(conn: sqlite3.Connection, discord_id: str) -> None:
+def _recompute_summary_for_discord_id(
+    conn: sqlite3.Connection,
+    discord_id: str,
+    *,
+    snapshot_table: str = "fartboy_holders",
+    tx_db_path: Optional[str] = None,
+    tx_table: str = "incoming_transactions",
+) -> None:
+    """Rebuild SUMMARY_TABLE from verified snapshot rows plus tx-only attribution (see holder bot)."""
     wallets = conn.execute(
-        """
+        f"""
         SELECT wallet_address, amount_fartboy, donated_usd, discord_name
-        FROM fartboy_holders
+        FROM {snapshot_table}
         WHERE discord_id = ?
         """,
         (discord_id,),
     ).fetchall()
+
+    verified_wallets = {str(r[0]) for r in wallets if r and r[0]}
+    extra_usd = 0.0
+    if tx_db_path:
+        try:
+            with sqlite3.connect(tx_db_path) as tx_conn:
+                _init_transactions_db(tx_conn, tx_table)
+                if verified_wallets:
+                    placeholders = ",".join("?" * len(verified_wallets))
+                    row = tx_conn.execute(
+                        f"""
+                        SELECT COALESCE(SUM(value_usdc), 0)
+                        FROM {tx_table}
+                        WHERE discord_id = ?
+                          AND sender_wallet NOT IN ({placeholders})
+                        """,
+                        (discord_id, *verified_wallets),
+                    ).fetchone()
+                else:
+                    row = tx_conn.execute(
+                        f"""
+                        SELECT COALESCE(SUM(value_usdc), 0)
+                        FROM {tx_table}
+                        WHERE discord_id = ?
+                        """,
+                        (discord_id,),
+                    ).fetchone()
+                extra_usd = float(row[0] or 0) if row else 0.0
+        except sqlite3.Error:
+            extra_usd = 0.0
+
     if not wallets:
-        return
-    total_holdings = sum(float(r[1] or 0) for r in wallets)
-    total_donated_usd = sum(float(r[2] or 0) for r in wallets)
-    discord_name = next((r[3] for r in wallets if r[3]), None)
-    wallet_list = ",".join(sorted({r[0] for r in wallets if r[0]}))
+        if extra_usd <= 0:
+            return
+        total_holdings = 0.0
+        total_donated_snapshot = 0.0
+        name_row = conn.execute(
+            f"SELECT discord_name FROM {SUMMARY_TABLE} WHERE discord_id = ?",
+            (discord_id,),
+        ).fetchone()
+        discord_name = name_row[0] if name_row and name_row[0] else None
+        wallet_list = ""
+    else:
+        total_holdings = sum(float(r[1] or 0) for r in wallets)
+        total_donated_snapshot = sum(float(r[2] or 0) for r in wallets)
+        discord_name = next((r[3] for r in wallets if r[3]), None)
+        wallet_list = ",".join(sorted({str(r[0]) for r in wallets if r[0]}))
+
+    total_donated_usd = total_donated_snapshot + extra_usd
+
     existing = conn.execute(
         f"""
         SELECT leaderboard_visible, roles
@@ -851,7 +903,13 @@ class IncomingTracker:
                                     (discord_id, discord_name, row["sender_wallet"], discord_id),
                                 )
                                 snapshot_conn.commit()
-                                _recompute_summary_for_discord_id(snapshot_conn, discord_id)
+                                _recompute_summary_for_discord_id(
+                                    snapshot_conn,
+                                    discord_id,
+                                    snapshot_table=self.snapshot_table,
+                                    tx_db_path=self.tx_db,
+                                    tx_table=self.tx_table,
+                                )
                             else:
                                 _record_used_otp(
                                     snapshot_conn,
