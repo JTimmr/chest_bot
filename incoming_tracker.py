@@ -448,6 +448,24 @@ def _init_snapshot_db(conn: sqlite3.Connection, table: str) -> None:
         cur.execute(f"ALTER TABLE {table} ADD COLUMN discord_name TEXT")
     if "on_leaderboard" not in existing_cols:
         cur.execute(f"ALTER TABLE {table} ADD COLUMN on_leaderboard INTEGER NOT NULL DEFAULT 0")
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS verification_rejections (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            discord_id TEXT,
+            sender_wallet TEXT,
+            signature TEXT,
+            reason TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_vr_discord_created
+        ON verification_rejections (discord_id, created_at)
+        """
+    )
     conn.commit()
 
 
@@ -535,6 +553,85 @@ def _load_exchange_wallets(conn: sqlite3.Connection) -> Set[str]:
         return {row[0] for row in rows if row and row[0]}
     except sqlite3.Error:
         return set()
+
+
+def _peek_assigned_otp(
+    conn: sqlite3.Connection,
+    otp_value: str,
+    tick_size: int,
+) -> Optional[Tuple[str, str]]:
+    """SELECT-only check for an assigned OTP — does not mark it used."""
+    row = conn.execute(
+        f"""
+        SELECT assigned_to_discord_id, assigned_to_name
+        FROM {OTP_TABLE}
+        WHERE otp_value = ? AND tick_size = ? AND status = 'assigned'
+        """,
+        (otp_value, tick_size),
+    ).fetchone()
+    if not row:
+        return None
+    return row[0], row[1] or ""
+
+
+def _get_verification_order(state_db: Optional[str]) -> str:
+    """Read verification_order from STATE_DB donor_config. Defaults to 'strict'."""
+    if not state_db:
+        return "strict"
+    try:
+        with sqlite3.connect(state_db) as conn:
+            row = conn.execute(
+                "SELECT value FROM donor_config WHERE key = 'verification_order'"
+            ).fetchone()
+            return row[0] if row and row[0] in ("flexible", "strict") else "strict"
+    except sqlite3.Error:
+        return "strict"
+
+
+def _check_strict_gate(
+    conn: sqlite3.Connection,
+    snapshot_table: str,
+    sender_wallet: str,
+) -> Optional[str]:
+    """Check if a sender wallet passes the strict OTP gate.
+
+    Returns None if the gate passes, or a rejection reason string.
+    """
+    row = conn.execute(
+        f"""
+        SELECT amount_fartboy, donated_fartboy
+        FROM {snapshot_table}
+        WHERE wallet_address = ?
+        """,
+        (sender_wallet,),
+    ).fetchone()
+    if not row:
+        return "strict_no_snapshot_balance"
+    amount = float(row[0] or 0)
+    donated = float(row[1] or 0)
+    if amount <= 0:
+        return "strict_no_snapshot_balance"
+    if donated < amount * 0.01:
+        return "strict_below_1pct"
+    return None
+
+
+def _insert_verification_rejection(
+    conn: sqlite3.Connection,
+    discord_id: str,
+    sender_wallet: str,
+    signature: str,
+    reason: str,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO verification_rejections
+            (discord_id, sender_wallet, signature, reason, created_at)
+        VALUES (?, ?, ?, ?, datetime('now'))
+        """,
+        (discord_id, sender_wallet, signature, reason),
+    )
+    conn.commit()
 
 
 def _match_assigned_otp(
@@ -746,6 +843,7 @@ class IncomingTracker:
         max_pages: Optional[int] = 3,
         page_limit: int = 10,
         account_refresh_seconds: int = 0,
+        state_db: Optional[str] = None,
     ) -> None:
         self.api_key = api_key
         self.target_wallet = target_wallet
@@ -755,6 +853,7 @@ class IncomingTracker:
         self.snapshot_db = snapshot_db
         self.snapshot_table = snapshot_table
         self.checkpoint_file = checkpoint_file
+        self.state_db = state_db
         self.delay = max(0.05, delay)
         if max_pages is None or max_pages <= 0:
             self.max_pages = None
@@ -879,10 +978,39 @@ class IncomingTracker:
                             continue
                         decimals = int(row.get("decimals", 0))
                         amount_raw = int(row.get("amount_raw", 0))
+                        # Mirror: holder_leaderboard_bot.py _process_signature has
+                        # the same peek/strict/rejection logic and must stay in sync.
+                        verification_order = _get_verification_order(self.state_db)
                         for tick in (5, 6):
                             otp_value = _format_otp_if_exact(amount_raw, decimals, tick)
                             if not otp_value:
                                 continue
+                            peek = _peek_assigned_otp(snapshot_conn, otp_value, tick)
+                            if peek is None:
+                                _record_used_otp(
+                                    snapshot_conn,
+                                    otp_value,
+                                    tick,
+                                    row["signature"],
+                                    row["sender_wallet"],
+                                )
+                                continue
+                            discord_id, discord_name = peek
+                            if verification_order == "strict":
+                                rejection = _check_strict_gate(
+                                    snapshot_conn,
+                                    self.snapshot_table,
+                                    row["sender_wallet"],
+                                )
+                                if rejection:
+                                    _insert_verification_rejection(
+                                        snapshot_conn,
+                                        discord_id,
+                                        row["sender_wallet"],
+                                        row["signature"],
+                                        rejection,
+                                    )
+                                    break
                             matched = _match_assigned_otp(
                                 snapshot_conn,
                                 otp_value,
@@ -891,7 +1019,6 @@ class IncomingTracker:
                                 row["sender_wallet"],
                             )
                             if matched:
-                                discord_id, discord_name = matched
                                 verified_discord_ids.append(discord_id)
                                 snapshot_conn.execute(
                                     f"""
@@ -910,14 +1037,7 @@ class IncomingTracker:
                                     tx_db_path=self.tx_db,
                                     tx_table=self.tx_table,
                                 )
-                            else:
-                                _record_used_otp(
-                                    snapshot_conn,
-                                    otp_value,
-                                    tick,
-                                    row["signature"],
-                                    row["sender_wallet"],
-                                )
+                            break
         finally:
             tx_conn.close()
             snapshot_conn.close()

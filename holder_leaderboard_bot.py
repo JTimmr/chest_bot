@@ -38,8 +38,11 @@ from incoming_tracker import (
     _ensure_otp_registry,
     _expire_otps,
     _format_otp_if_exact,
+    _peek_assigned_otp,
     _match_assigned_otp,
     _record_used_otp,
+    _check_strict_gate,
+    _insert_verification_rejection,
 )
 
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
@@ -436,6 +439,50 @@ def _ensure_donor_config_schema() -> None:
         log.error("Failed to ensure donor_config schema: %s", exc)
 
 
+def _ensure_user_threshold_resolution_schema() -> None:
+    try:
+        with _connect_db(STATE_DB) as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_threshold_resolution (
+                    discord_id TEXT PRIMARY KEY,
+                    resolution TEXT NOT NULL CHECK (resolution IN ('force_met', 'force_not_met')),
+                    updated_at TEXT NOT NULL,
+                    actor_discord_id TEXT
+                )
+                """
+            )
+            conn.commit()
+    except sqlite3.Error as exc:
+        log.error("Failed to ensure user_threshold_resolution schema: %s", exc)
+
+
+def _ensure_verification_rejections_schema() -> None:
+    try:
+        with _connect_db(SNAPSHOT_DB) as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS verification_rejections (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    discord_id TEXT,
+                    sender_wallet TEXT,
+                    signature TEXT,
+                    reason TEXT,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_vr_discord_created
+                ON verification_rejections (discord_id, created_at)
+                """
+            )
+            conn.commit()
+    except sqlite3.Error as exc:
+        log.error("Failed to ensure verification_rejections schema: %s", exc)
+
+
 def _get_donor_config(key: str) -> str | None:
     try:
         with _connect_db(STATE_DB) as conn:
@@ -526,12 +573,33 @@ def _fetch_tiers() -> List[Dict]:
         return []
 
 
+def _get_user_threshold_resolution(discord_id: str) -> str | None:
+    """Return 'force_met', 'force_not_met', or None (no override)."""
+    try:
+        with _connect_db(STATE_DB) as conn:
+            row = conn.execute(
+                "SELECT resolution FROM user_threshold_resolution WHERE discord_id = ?",
+                (discord_id,),
+            ).fetchone()
+            return row[0] if row else None
+    except sqlite3.Error as exc:
+        log.error("Failed to read user_threshold_resolution for %s: %s", discord_id, exc)
+        return None
+
+
 def _check_base_eligibility(discord_id: str) -> bool:
     """Check if a verified user qualifies for the base donor tier.
 
-    Eligible if any linked wallet donated >= 1% of snapshot holdings,
-    or if user has no snapshot holdings and total_donated_usd >= $50.
+    Evaluation order:
+      1. user_threshold_resolution override (force_met / force_not_met)
+      2. Automatic: any linked wallet donated >= 1% of snapshot holdings
     """
+    resolution = _get_user_threshold_resolution(discord_id)
+    if resolution == "force_not_met":
+        return False
+    if resolution == "force_met":
+        return True
+
     try:
         with _connect_db(SNAPSHOT_DB) as conn:
             wallets = conn.execute(
@@ -545,27 +613,11 @@ def _check_base_eligibility(discord_id: str) -> bool:
             if not wallets:
                 return False
 
-            summary = conn.execute(
-                f"""
-                SELECT total_donated_usd
-                FROM {SUMMARY_TABLE}
-                WHERE discord_id = ?
-                """,
-                (discord_id,),
-            ).fetchone()
-            total_donated_usd = float(summary[0] or 0) if summary else 0.0
-
-            has_snapshot_holdings = False
             for _wallet, amount_fartboy, donated_fartboy in wallets:
                 amount = float(amount_fartboy or 0)
                 donated = float(donated_fartboy or 0)
-                if amount > 0:
-                    has_snapshot_holdings = True
-                    if donated >= amount * 0.01:
-                        return True
-
-            if not has_snapshot_holdings:
-                return total_donated_usd >= 50.0
+                if amount > 0 and donated >= amount * 0.01:
+                    return True
 
             return False
     except sqlite3.Error as exc:
@@ -1559,6 +1611,9 @@ async def _process_signature(signature: str, discord_id: str | None = None) -> T
                 tx_conn.commit()
         # Always attempt OTP matching for small FARTBOY transfers, even if the
         # transaction already exists or pricing was unavailable.
+        # Mirror: incoming_tracker.py IncomingTracker.run_once has the same
+        # peek/strict/rejection logic and must stay in sync.
+        verification_order = _get_donor_config("verification_order") or "strict"
         for row in rows:
             if row.get("token") != "FARTBOY" or row.get("amount_ui", 0) >= 1:
                 continue
@@ -1570,6 +1625,32 @@ async def _process_signature(signature: str, discord_id: str | None = None) -> T
                 otp_value = _format_otp_if_exact(amount_raw, decimals, tick)
                 if not otp_value:
                     continue
+                peek = _peek_assigned_otp(snapshot_conn, otp_value, tick)
+                if peek is None:
+                    _record_used_otp(
+                        snapshot_conn,
+                        otp_value,
+                        tick,
+                        row["signature"],
+                        row["sender_wallet"],
+                    )
+                    continue
+                otp_discord_id, otp_discord_name = peek
+                if verification_order == "strict":
+                    rejection = _check_strict_gate(
+                        snapshot_conn,
+                        SNAPSHOT_TABLE,
+                        row["sender_wallet"],
+                    )
+                    if rejection:
+                        _insert_verification_rejection(
+                            snapshot_conn,
+                            otp_discord_id,
+                            row["sender_wallet"],
+                            row["signature"],
+                            rejection,
+                        )
+                        break
                 matched = _match_assigned_otp(
                     snapshot_conn,
                     otp_value,
@@ -1578,7 +1659,6 @@ async def _process_signature(signature: str, discord_id: str | None = None) -> T
                     row["sender_wallet"],
                 )
                 if matched:
-                    otp_discord_id, otp_discord_name = matched
                     snapshot_conn.execute(
                         f"""
                         UPDATE {SNAPSHOT_TABLE}
@@ -1590,14 +1670,7 @@ async def _process_signature(signature: str, discord_id: str | None = None) -> T
                     )
                     snapshot_conn.commit()
                     _recompute_summary_for_discord_id(otp_discord_id)
-                else:
-                    _record_used_otp(
-                        snapshot_conn,
-                        otp_value,
-                        tick,
-                        row["signature"],
-                        row["sender_wallet"],
-                    )
+                break
     if attribution_discord_id:
         _recompute_summary_for_discord_id(attribution_discord_id)
     return len(rows), inserted
@@ -1650,6 +1723,26 @@ def _update_wallet_verification(
     except sqlite3.Error as exc:
         log.error("Failed to update wallet verification: %s", exc)
         return False
+
+
+def _get_snapshot_discord_id_for_wallet(wallet: str) -> str | None:
+    """Return linked discord_id for wallet in snapshot, or None if missing/unlinked."""
+    try:
+        with _connect_db(SNAPSHOT_DB) as conn:
+            row = conn.execute(
+                f"""
+                SELECT discord_id
+                FROM {SNAPSHOT_TABLE}
+                WHERE wallet_address = ?
+                """,
+                (wallet,),
+            ).fetchone()
+        if not row or not row[0]:
+            return None
+        return str(row[0])
+    except sqlite3.Error as exc:
+        log.error("Failed to read snapshot link for wallet %s: %s", wallet, exc)
+        return None
 
 
 def _lookup_wallet(wallet: str) -> tuple[bool, float]:
@@ -2237,6 +2330,8 @@ class LeaderboardBot(commands.Bot):
         _ensure_targets_schema()
         _ensure_donation_tiers_schema()
         _ensure_donor_config_schema()
+        _ensure_user_threshold_resolution_schema()
+        _ensure_verification_rejections_schema()
         self.add_view(VerificationButtonsView())
         if not self._tracker:
             api_key = os.getenv("HELIUS_API_KEY")
@@ -2247,6 +2342,7 @@ class LeaderboardBot(commands.Bot):
                     api_key=api_key,
                     target_wallet=target_wallet,
                     fartboy_mint=fartboy_mint,
+                    state_db=STATE_DB,
                 )
             else:
                 missing = []
@@ -2370,26 +2466,6 @@ class LeaderboardBot(commands.Bot):
             discord_ids = {did for w in wallets if (did := _discord_id_for_wallet(w))}
             for did in discord_ids:
                 _recompute_summary_for_discord_id(did)
-            if verified_ids:
-                for did in set(verified_ids):
-                    try:
-                        user = await self.fetch_user(int(did))
-                        if user:
-                            dm_message = (
-                                "Your wallet verification transfer was received. "
-                                "Your wallet is now linked."
-                            )
-                            if not _is_leaderboard_visible(str(did)):
-                                dm_message += (
-                                    "\n\n"
-                                    "Reminder: you are not on the leaderboard yet. "
-                                    "Use /leaderboardvisibility if you want your name shown. "
-                                    "You can also remove yourself anytime to make your donations anonymous again. "
-                                    "This is voluntary and does not affect any perks."
-                                )
-                            await _send_dm_with_intro(user, dm_message)
-                    except discord.HTTPException:
-                        log.warning("Failed to DM verification for discord id %s", did)
             if count > 0 and GUILD_ID:
                 guild = self.get_guild(int(GUILD_ID))
                 if guild:
@@ -2471,7 +2547,6 @@ async def set_leaderboard_visibility(
 
 
 @bot.command(name="checkwallet")
-@commands.has_permissions(manage_guild=True)
 async def checkwallet(ctx: commands.Context, wallet: str = ""):
     if not wallet:
         return await ctx.send("Usage: `!checkwallet WALLET_ADDRESS`")
@@ -2619,8 +2694,11 @@ async def verify_wallet_otp(interaction: discord.Interaction):
         "You can always run /verifywallet again after that to get a new OTP.\n\n"
         "Your verification should be done within 3 minutes after the OTP amount of FARTBOY has been sent. "
         "You can check the status and trigger immediate verification by running /verifystatus.\n\n"
-        "After the verification is complete, you will receive a DM confirming that your wallet is verified. "
-        "If you turned DMs off, you can only check the status with /verifystatus."
+        "**Important:** Your wallet must be on the holder snapshot with a positive balance, and you "
+        "must have donated at least 1% of that balance to the war chest **before** sending the OTP. "
+        "If you send the OTP too early, verification will be rejected and you can try again after "
+        "donating more. Wallets not on the snapshot (for example exchange hot wallets) cannot use "
+        "automatic OTP — ask an admin for manual verification instead."
     )
     if show_reminder:
         instructions += (
@@ -2649,28 +2727,6 @@ async def verify_status(interaction: discord.Interaction):
             }
             for did in discord_ids:
                 _recompute_summary_for_discord_id(did)
-            if verified_ids:
-                for did in set(verified_ids):
-                    try:
-                        user = await bot.fetch_user(int(did))
-                        if user:
-                            dm_message = (
-                                "Your wallet verification transfer was received. "
-                                "Your wallet is now linked."
-                            )
-                            if not _is_leaderboard_visible(str(did)):
-                                dm_message += (
-                                    "\n\n"
-                                    "Reminder: you are not on the leaderboard yet. "
-                                    "Use /leaderboardvisibility if you want your name shown. "
-                                    "You can also remove yourself anytime to make your donations anonymous again. "
-                                    "This is voluntary and does not affect any perks."
-                                )
-                            await _send_dm_with_intro(user, dm_message)
-                    except discord.HTTPException:
-                        log.warning(
-                            "Failed to DM verification for discord id %s", did
-                        )
             if count:
                 log.info("On-demand tracker run found %s new transactions.", count)
         except Exception as exc:
@@ -2735,6 +2791,31 @@ async def verify_status(interaction: discord.Interaction):
         f"Your verification history:\n{body}",
         ephemeral=True,
     )
+
+    try:
+        with _connect_db(SNAPSHOT_DB) as conn:
+            rejections = conn.execute(
+                """
+                SELECT reason, sender_wallet, created_at
+                FROM verification_rejections
+                WHERE discord_id = ?
+                ORDER BY created_at DESC
+                LIMIT 5
+                """,
+                (str(interaction.user.id),),
+            ).fetchall()
+            if rejections:
+                rej_lines = []
+                for reason, wallet, created_at in rejections:
+                    short_wallet = f"{wallet[:6]}...{wallet[-4:]}" if wallet and len(wallet) > 10 else (wallet or "?")
+                    rej_lines.append(f"- {reason} | wallet {short_wallet} | {created_at}")
+                await interaction.followup.send(
+                    "Recent verification rejections (strict mode):\n" + "\n".join(rej_lines),
+                    ephemeral=True,
+                )
+    except sqlite3.Error:
+        pass
+
     if not _is_leaderboard_visible(str(interaction.user.id)):
         await interaction.followup.send(_reminder_text(), ephemeral=True)
 
@@ -2772,7 +2853,6 @@ async def dm_welcome(interaction: discord.Interaction):
 
 
 @bot.command(name="setdonationleaderboard")
-@commands.has_permissions(manage_guild=True)
 async def setdonationleaderboard(
     ctx: commands.Context, channel: discord.TextChannel | None = None, limit: int = DEFAULT_LIMIT
 ):
@@ -2799,7 +2879,6 @@ async def setdonationleaderboard(
 
 
 @bot.command(name="setdonationleadersize")
-@commands.has_permissions(manage_guild=True)
 async def setdonationleadersize(ctx: commands.Context, limit: int = DEFAULT_LIMIT):
     limit = max(1, min(limit, 100))
     _set_limit("donations", limit)
@@ -2807,7 +2886,6 @@ async def setdonationleadersize(ctx: commands.Context, limit: int = DEFAULT_LIMI
 
 
 @bot.command(name="settrackerinterval")
-@commands.has_permissions(manage_guild=True)
 async def settrackerinterval(ctx: commands.Context, seconds: int = 0):
     if seconds <= 0:
         return await ctx.send("Usage: `!settrackerinterval SECONDS`")
@@ -2817,7 +2895,6 @@ async def settrackerinterval(ctx: commands.Context, seconds: int = 0):
 
 
 @bot.command(name="setpagelimit")
-@commands.has_permissions(manage_guild=True)
 async def setpagelimit(ctx: commands.Context, limit: int = 0):
     if limit <= 0:
         return await ctx.send("Usage: `!setpagelimit LIMIT`")
@@ -2829,7 +2906,6 @@ async def setpagelimit(ctx: commands.Context, limit: int = 0):
 
 
 @bot.command(name="golive")
-@commands.has_permissions(manage_guild=True)
 async def golive(ctx: commands.Context):
     if not bot._tracker:
         return await ctx.send("Tracker is not configured (missing env vars).")
@@ -2912,12 +2988,35 @@ _COMMAND_HELP: Dict[str, Dict[str, str]] = {
     "manualverify": {
         "summary": "Manually link a wallet to a Discord user.",
         "usage": "`!manualverify @user WALLET_ADDRESS`",
-        "details": "Leaderboard visibility stays off until the user opts in.",
+        "details": (
+            "Links the wallet to the user. If the wallet is not in the snapshot, "
+            "creates a new row with zero balance. Off-snapshot wallets need "
+            "`!setuserthreshold @user true` for perk eligibility. "
+            "If the wallet is already linked to another user, the command refuses; "
+            "use `!removeverification WALLET_ADDRESS` first to unlink."
+        ),
     },
     "removeverification": {
         "summary": "Remove verification for a user or wallet.",
         "usage": "`!removeverification WALLET_ADDRESS`",
         "details": "Dangerous: unlinks that wallet and clears any donation links.",
+    },
+    "setuserthreshold": {
+        "summary": "Override perk eligibility threshold for a user.",
+        "usage": "`!setuserthreshold @user true|false|reset`",
+        "details": (
+            "true = force eligible, false = force ineligible, reset = use automatic 1% check. "
+            "This is the only command that controls threshold overrides."
+        ),
+    },
+    "setverificationorder": {
+        "summary": "Set OTP verification mode (strict or flexible).",
+        "usage": "`!setverificationorder strict|flexible`",
+        "details": (
+            "strict (default): OTP only accepted after the wallet has donated >= 1% of snapshot holdings. "
+            "flexible: OTP links wallet without requiring 1% donation first. "
+            "No args prints current setting."
+        ),
     },
     "synccommands": {
         "summary": "Sync slash commands.",
@@ -3064,6 +3163,8 @@ def _build_help_embed(command_name: Optional[str]) -> discord.Embed:
             "resetverification",
             "setexchangewallets",
             "removeexchangewallets",
+            "setuserthreshold",
+            "setverificationorder",
         ],
         "Transactions": [
             "tx",
@@ -3133,7 +3234,6 @@ async def donationbothelp(ctx: commands.Context):
 
 
 @bot.command(name="snapshotholders")
-@commands.has_permissions(manage_guild=True)
 async def snapshotholders(ctx: commands.Context):
     await ctx.send("Starting snapshot... this can take a few minutes.")
     try:
@@ -3164,7 +3264,6 @@ async def snapshotholders(ctx: commands.Context):
 
 
 @bot.command(name="resetverification")
-@commands.has_permissions(manage_guild=True)
 async def resetverification(ctx: commands.Context):
     try:
         with _connect_db(SNAPSHOT_DB) as conn:
@@ -3187,7 +3286,6 @@ async def resetverification(ctx: commands.Context):
 
 
 @bot.command(name="manualverify")
-@commands.has_permissions(manage_guild=True)
 async def manualverify(
     ctx: commands.Context,
     member: discord.Member | None = None,
@@ -3205,18 +3303,40 @@ async def manualverify(
             "That wallet is marked as an exchange wallet and cannot be verified."
         )
     on_leaderboard = 0
+    discord_id = str(member.id)
+    discord_name = str(member)
+    existing_holder = _get_snapshot_discord_id_for_wallet(wallet)
+    if existing_holder is not None and existing_holder != discord_id:
+        return await ctx.send(
+            f"This wallet is already verified and linked to <@{existing_holder}>. "
+            f"To assign it to someone else, run `!removeverification {wallet}` first."
+        )
+    inserted_new_row = False
     success = _update_wallet_verification(
         wallet=wallet,
-        discord_id=str(member.id),
-        discord_name=str(member),
+        discord_id=discord_id,
+        discord_name=discord_name,
         on_leaderboard=on_leaderboard,
     )
     if not success:
-        return await ctx.send(
-            "Wallet not found in the snapshot. Run a snapshot first."
-        )
-    _set_summary_visibility(str(member.id), on_leaderboard)
-    _recompute_summary_for_discord_id(str(member.id))
+        try:
+            with _connect_db(SNAPSHOT_DB) as conn:
+                conn.execute(
+                    f"""
+                    INSERT INTO {SNAPSHOT_TABLE}
+                        (wallet_address, amount_fartboy, donated_fartboy, donated_usd,
+                         discord_id, discord_name, on_leaderboard)
+                    VALUES (?, 0, 0, 0, ?, ?, ?)
+                    """,
+                    (wallet, discord_id, discord_name, on_leaderboard),
+                )
+                conn.commit()
+                inserted_new_row = True
+        except sqlite3.Error as exc:
+            log.error("Failed to insert snapshot row for manual verify: %s", exc)
+            return await ctx.send("Failed to create snapshot row. Check logs.")
+    _set_summary_visibility(discord_id, on_leaderboard)
+    _recompute_summary_for_discord_id(discord_id)
     try:
         with _connect_db(TX_DB) as tx_conn:
             tx_conn.execute(
@@ -3225,18 +3345,21 @@ async def manualverify(
                 SET discord_id = ?
                 WHERE sender_wallet = ?
                 """,
-                (str(member.id), wallet),
+                (discord_id, wallet),
             )
             tx_conn.commit()
     except sqlite3.Error as exc:
         log.warning("Failed to update tx discord id for manual verify: %s", exc)
-    await ctx.send(
-        f"Linked `{wallet}` to {member.mention} (leaderboard visibility: off)."
-    )
+    msg = f"Linked `{wallet}` to {member.mention} (leaderboard visibility: off)."
+    if inserted_new_row:
+        msg += (
+            "\nWallet was not in the original snapshot (balance=0). "
+            "To grant perk eligibility, also run `!setuserthreshold @user true`."
+        )
+    await ctx.send(msg)
 
 
 @bot.command(name="removeverification")
-@commands.has_permissions(manage_guild=True)
 async def removeverification(ctx: commands.Context, target: str = ""):
     if not target:
         return await ctx.send(
@@ -3249,8 +3372,57 @@ async def removeverification(ctx: commands.Context, target: str = ""):
     await ctx.send(f"Removed verification for {removed} wallet(s).")
 
 
+@bot.command(name="setuserthreshold")
+async def setuserthreshold(ctx: commands.Context, member: discord.Member | None = None, value: str = ""):
+    if not member or value not in ("true", "false", "reset"):
+        return await ctx.send("Usage: `!setuserthreshold @user true|false|reset`")
+    discord_id = str(member.id)
+    actor_id = str(ctx.author.id)
+    try:
+        with _connect_db(STATE_DB) as conn:
+            _ensure_user_threshold_resolution_schema()
+            if value == "reset":
+                conn.execute(
+                    "DELETE FROM user_threshold_resolution WHERE discord_id = ?",
+                    (discord_id,),
+                )
+                conn.commit()
+                return await ctx.send(
+                    f"Threshold override removed for {member.mention}. Automatic eligibility applies."
+                )
+            resolution = "force_met" if value == "true" else "force_not_met"
+            conn.execute(
+                """
+                INSERT INTO user_threshold_resolution (discord_id, resolution, updated_at, actor_discord_id)
+                VALUES (?, ?, datetime('now'), ?)
+                ON CONFLICT(discord_id) DO UPDATE SET
+                    resolution = excluded.resolution,
+                    updated_at = excluded.updated_at,
+                    actor_discord_id = excluded.actor_discord_id
+                """,
+                (discord_id, resolution, actor_id),
+            )
+            conn.commit()
+        label = "met (force)" if value == "true" else "not met (force)"
+        await ctx.send(f"Threshold for {member.mention} set to **{label}**.")
+    except sqlite3.Error as exc:
+        log.error("Failed to set user threshold: %s", exc)
+        await ctx.send("Failed to update threshold. Check logs.")
+
+
+@bot.command(name="setverificationorder")
+async def setverificationorder(ctx: commands.Context, mode: str = ""):
+    _ensure_donor_config_schema()
+    if not mode:
+        current = _get_donor_config("verification_order") or "strict"
+        return await ctx.send(f"Current verification order: **{current}**")
+    if mode not in ("strict", "flexible"):
+        return await ctx.send("Usage: `!setverificationorder strict|flexible`")
+    _set_donor_config("verification_order", mode)
+    await ctx.send(f"Verification order set to **{mode}**.")
+
+
 @bot.command(name="setexchangewallets")
-@commands.has_permissions(manage_guild=True)
 async def setexchangewallets(ctx: commands.Context, exchange_name: str = "", *wallets: str):
     if not exchange_name or not wallets:
         return await ctx.send(
@@ -3343,7 +3515,6 @@ async def setexchangewallets(ctx: commands.Context, exchange_name: str = "", *wa
 
 
 @bot.command(name="removeexchangewallets")
-@commands.has_permissions(manage_guild=True)
 async def removeexchangewallets(ctx: commands.Context, *wallets: str):
     if not wallets:
         return await ctx.send("Usage: `!removeexchangewallets WALLET1 WALLET2 ...`")
@@ -3367,7 +3538,6 @@ async def removeexchangewallets(ctx: commands.Context, *wallets: str):
 
 
 @bot.command(name="synccommands")
-@commands.has_permissions(manage_guild=True)
 async def synccommands(ctx: commands.Context):
     try:
         if ENABLE_DM_COMMANDS:
@@ -3398,7 +3568,6 @@ async def synccommands(ctx: commands.Context):
 
 
 @bot.command(name="listcommands")
-@commands.has_permissions(manage_guild=True)
 async def listcommands(ctx: commands.Context):
     try:
         global_cmds = await bot.tree.fetch_commands()
@@ -3416,7 +3585,6 @@ async def listcommands(ctx: commands.Context):
 
 
 @bot.command(name="tx")
-@commands.has_permissions(manage_guild=True)
 async def tx_lookup(ctx: commands.Context, target: str = ""):
     if not target:
         return await ctx.send("Usage: `!tx @user` or `!tx WALLET_ADDRESS`")
@@ -3449,7 +3617,6 @@ async def tx_lookup(ctx: commands.Context, target: str = ""):
 
 
 @bot.command(name="addtransaction")
-@commands.has_permissions(manage_guild=True)
 async def addtransaction(ctx: commands.Context, signature: str = ""):
     if not signature:
         return await ctx.send("Usage: `!addtransaction SIGNATURE [@user]`")
@@ -3480,7 +3647,6 @@ async def setleaderboard_error(ctx: commands.Context, error: Exception):
 
 
 @bot.command(name="settarget")
-@commands.has_permissions(manage_guild=True)
 async def settarget(ctx: commands.Context, amount: str = "", *, name: str = ""):
     """Add a fundraising target. Usage: !settarget <amount> [name]"""
     if not amount:
@@ -3501,7 +3667,6 @@ async def settarget(ctx: commands.Context, amount: str = "", *, name: str = ""):
 
 
 @bot.command(name="removetarget")
-@commands.has_permissions(manage_guild=True)
 async def removetarget(ctx: commands.Context, target_id: str = ""):
     """Remove a fundraising target by ID. Usage: !removetarget <id>"""
     if not target_id:
@@ -3557,7 +3722,6 @@ async def target_error(ctx: commands.Context, error: Exception):
 
 
 @bot.command(name="setbaserole")
-@commands.has_permissions(manage_guild=True)
 async def setbaserole(ctx: commands.Context, *, role_name: str = ""):
     """Set the base contributor role given to all qualifying donors."""
     if not role_name.strip():
@@ -3570,7 +3734,6 @@ async def setbaserole(ctx: commands.Context, *, role_name: str = ""):
 
 
 @bot.command(name="settier")
-@commands.has_permissions(manage_guild=True)
 async def settier(ctx: commands.Context, min_usd: str = "", emoji: str = "", *, role_name: str = ""):
     """Add a donation tier. Usage: !settier <min_usd> <emoji> <role_name>"""
     if not min_usd or not emoji or not role_name.strip():
@@ -3593,7 +3756,6 @@ async def settier(ctx: commands.Context, min_usd: str = "", emoji: str = "", *, 
 
 
 @bot.command(name="removetier")
-@commands.has_permissions(manage_guild=True)
 async def removetier(ctx: commands.Context, tier_id: str = ""):
     """Remove a donation tier by ID. Usage: !removetier <id>"""
     if not tier_id:
@@ -3635,7 +3797,6 @@ async def tiers_cmd(ctx: commands.Context):
 
 
 @bot.command(name="syncdonorroles")
-@commands.has_permissions(manage_guild=True)
 async def syncdonorroles(ctx: commands.Context):
     """Force a full donor role and nickname sync for all verified users."""
     if not GUILD_ID:
