@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import sqlite3
 import time
 from datetime import datetime, timezone
@@ -635,6 +636,19 @@ async def sync_donor_roles(guild: discord.Guild) -> Dict[str, int]:
     if not tiers or not base_role_name:
         return counts
 
+    # Resolve any stored mention strings to actual role names
+    mention_match = re.match(r"<@&(\d+)>", base_role_name)
+    if mention_match:
+        role_obj = guild.get_role(int(mention_match.group(1)))
+        if role_obj:
+            base_role_name = role_obj.name
+    for t in tiers:
+        tmatch = re.match(r"<@&(\d+)>", t["role_name"])
+        if tmatch:
+            role_obj = guild.get_role(int(tmatch.group(1)))
+            if role_obj:
+                t["role_name"] = role_obj.name
+
     tiers_desc = sorted(tiers, key=lambda t: t["min_usd"], reverse=True)
     all_role_names = {base_role_name} | {t["role_name"] for t in tiers}
     known_emojis = [t["emoji"] for t in tiers]
@@ -711,16 +725,6 @@ async def sync_donor_roles(guild: discord.Guild) -> Dict[str, int]:
         roles_to_add = set()
         roles_to_remove = set()
 
-        log.warning(
-            "DEBUG SYNC for %s: base_role=%s (id=%s), tier_role=%s (id=%s), "
-            "member_role_ids=%s, member_role_names=%s",
-            discord_id,
-            base_role.name, base_role.id,
-            target_tier_role.name, target_tier_role.id,
-            [r.id for r in member.roles],
-            [r.name for r in member.roles],
-        )
-
         if base_role not in member.roles:
             roles_to_add.add(base_role)
         if target_tier_role not in member.roles:
@@ -734,7 +738,7 @@ async def sync_donor_roles(guild: discord.Guild) -> Dict[str, int]:
             if roles_to_remove:
                 await member.remove_roles(*roles_to_remove, reason="Donor tier update")
             if roles_to_add:
-                log.warning(
+                log.info(
                     "Adding roles %s to %s (member has %d roles, is_owner=%s)",
                     [r.name for r in roles_to_add],
                     discord_id,
@@ -3634,9 +3638,17 @@ async def setbaserole(ctx: commands.Context, *, role_name: str = ""):
     """Set the base contributor role given to all qualifying donors."""
     if not role_name.strip():
         return await ctx.send("Usage: `!setbaserole <role_name>`\nExample: `!setbaserole Contributor`")
-    success = _set_donor_config("base_role_name", role_name.strip())
+    resolved = role_name.strip()
+    mention_match = re.match(r"<@&(\d+)>", resolved)
+    if mention_match:
+        role = ctx.guild.get_role(int(mention_match.group(1)))
+        if role:
+            resolved = role.name
+        else:
+            return await ctx.send("Could not find that role in this server.")
+    success = _set_donor_config("base_role_name", resolved)
     if success:
-        await ctx.send(f"Base donor role set to **{role_name.strip()}**.")
+        await ctx.send(f"Base donor role set to **{resolved}**.")
     else:
         await ctx.send("Failed to set base role. Check logs.")
 
@@ -3655,11 +3667,19 @@ async def settier(ctx: commands.Context, min_usd: str = "", emoji: str = "", *, 
             return await ctx.send("Minimum USD must be zero or positive.")
     except ValueError:
         return await ctx.send("Invalid amount. Use a number like `100` or `250.00`.")
-    tier_id = _add_tier(amount, emoji.strip(), role_name.strip())
+    resolved = role_name.strip()
+    mention_match = re.match(r"<@&(\d+)>", resolved)
+    if mention_match:
+        role = ctx.guild.get_role(int(mention_match.group(1)))
+        if role:
+            resolved = role.name
+        else:
+            return await ctx.send("Could not find that role in this server.")
+    tier_id = _add_tier(amount, emoji.strip(), resolved)
     if tier_id is None:
         return await ctx.send("Failed to add tier. Check logs.")
     await ctx.send(
-        f"Tier #{tier_id} added: **${amount:,.2f}** — {emoji.strip()} **{role_name.strip()}**"
+        f"Tier #{tier_id} added: **${amount:,.2f}** — {emoji.strip()} **{resolved}**"
     )
 
 
