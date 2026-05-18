@@ -2102,6 +2102,76 @@ class DonationLeaderboardPager(discord.ui.View):
         await interaction.response.edit_message(content=self._render_page(), view=self)
 
 
+class SignatureModal(discord.ui.Modal, title="Paste transaction signature"):
+    signature_input = discord.ui.TextInput(
+        label="Transaction signature",
+        placeholder="Paste the full tx signature from your wallet or Solscan",
+        style=discord.TextStyle.short,
+        required=True,
+        min_length=40,
+        max_length=120,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        sig = self.signature_input.value.strip()
+        discord_id = str(interaction.user.id)
+        try:
+            total, inserted = await _process_signature(sig)
+        except Exception as exc:
+            log.warning("Modal signature processing failed for %s: %s", sig[:16], exc)
+            return await interaction.followup.send(
+                "Something went wrong processing that signature. Please double-check it.",
+                ephemeral=True,
+            )
+        if total == 0:
+            return await interaction.followup.send(
+                "No incoming transfers to the war chest found in that transaction. "
+                "Make sure you pasted the correct signature.",
+                ephemeral=True,
+            )
+
+        # Re-run tracker + check verification result
+        if bot._tracker:
+            try:
+                await bot._tracker.run_once()
+            except Exception:
+                pass
+
+        recompute_summary_for_discord_id(discord_id)
+        verified_wallets = _find_wallets_for_discord_id(discord_id)
+        if verified_wallets:
+            short = ", ".join(
+                f"{w[:6]}...{w[-4:]}" if len(w) > 14 else w for w in verified_wallets
+            )
+            await interaction.followup.send(
+                f"**Verified!** Your wallet is now linked: {short}",
+                ephemeral=True,
+            )
+        else:
+            await interaction.followup.send(
+                f"Transaction processed ({total} transfer(s) found). "
+                f"OTP matching will run automatically — check back with **Verify status** shortly.",
+                ephemeral=True,
+            )
+
+
+class SignatureSubmitView(discord.ui.View):
+    """Ephemeral view with a button to open the signature modal."""
+
+    def __init__(self) -> None:
+        super().__init__(timeout=300)
+
+    @discord.ui.button(
+        label="Paste tx signature",
+        style=discord.ButtonStyle.primary,
+    )
+    async def paste_sig_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        await interaction.response.send_modal(SignatureModal())
+
+
 class VerificationButtonsView(discord.ui.View):
     def __init__(self) -> None:
         super().__init__(timeout=None)
@@ -2639,11 +2709,28 @@ async def verify_wallet_otp(interaction: discord.Interaction):
 
 @app_commands.command(
     name="verifystatus",
-    description="Show your verification status.",
+    description="Show your verification status. Optionally provide your tx signature.",
 )
-async def verify_status(interaction: discord.Interaction):
+@app_commands.describe(
+    signature="(Optional) Paste your transaction signature if auto-detection missed it."
+)
+async def verify_status(interaction: discord.Interaction, signature: str | None = None):
     await interaction.response.defer(ephemeral=True)
     discord_id = str(interaction.user.id)
+
+    # If the user provided a tx signature, process it directly via getTransaction
+    # (bypasses getSignaturesForAddress entirely — always works for on-chain txs).
+    if signature:
+        signature = signature.strip()
+        try:
+            total, inserted = await _process_signature(signature)
+            if total > 0:
+                log.info(
+                    "User %s provided signature %s — processed %s transfer(s).",
+                    discord_id, signature[:16], total,
+                )
+        except Exception as exc:
+            log.warning("Direct signature processing failed for %s: %s", signature[:16], exc)
 
     if bot._tracker:
         try:
@@ -2779,14 +2866,20 @@ async def verify_status(interaction: discord.Interaction):
             )
             parts.append(f"OTP amount: `{otp_value}`")
             parts.append(f"War chest: `{war_chest}`")
+            parts.append(
+                f"\nAlready sent? If auto-detection missed it, paste your tx signature below."
+            )
         else:
             parts = [
                 f"**Verification pending** — send the OTP amount to the war chest.",
                 f"OTP amount: `{otp_value}`",
                 f"War chest: `{war_chest}`",
                 f"Expires in {remaining}.",
+                f"\nAlready sent? If auto-detection missed it, paste your tx signature below.",
             ]
-        await interaction.followup.send("\n".join(parts), ephemeral=True)
+        await interaction.followup.send(
+            "\n".join(parts), ephemeral=True, view=SignatureSubmitView()
+        )
     elif has_recent_rejection:
         parts = [
             f"**Verification attempt received — not completed**",

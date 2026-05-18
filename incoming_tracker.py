@@ -133,6 +133,31 @@ class HeliusRPCClient:
         res = await self._make_request("getTokenSupply", params)
         return res.get("value") if res else None
 
+    async def get_enhanced_transactions(
+        self, address: str, limit: int = 20
+    ) -> List[Dict]:
+        url = (
+            f"https://api.helius.xyz/v0/addresses/{address}"
+            f"/transactions?api-key={self.api_key}&limit={limit}"
+        )
+        for attempt in range(MAX_RETRIES):
+            await self.rate_limiter.wait()
+            try:
+                async with self.session.get(url) as resp:
+                    if resp.status == 429:
+                        await self.rate_limiter.on_rate_limited()
+                        wait_time = RETRY_DELAY_BASE * (2 ** min(attempt, 4))
+                        await asyncio.sleep(wait_time)
+                        continue
+                    resp.raise_for_status()
+                    return await resp.json()
+            except aiohttp.ClientError:
+                if attempt == MAX_RETRIES - 1:
+                    return []
+                wait_time = RETRY_DELAY_BASE * (2 ** min(attempt, 4))
+                await asyncio.sleep(wait_time)
+        return []
+
 
 def _account_keys(tx: Dict) -> List[str]:
     keys = tx.get("transaction", {}).get("message", {}).get("accountKeys", [])
@@ -267,7 +292,52 @@ def _to_ts_seconds(value: Optional[object]) -> Optional[int]:
     return None
 
 
-CHECKPOINT_LOOKBACK = int(os.getenv("CHECKPOINT_LOOKBACK", "5"))
+ENHANCED_TX_LIMIT = int(os.getenv("ENHANCED_TX_LIMIT", "20"))
+
+
+async def _discover_via_enhanced_api(
+    client: "HeliusRPCClient",
+    target_wallet: str,
+    allowed_spl_mints: Set[str],
+    limit: int,
+) -> List[str]:
+    """Use Helius Enhanced Transactions API to find incoming transfer signatures.
+
+    Returns signatures for token/SOL transfers TO target_wallet that the
+    standard getSignaturesForAddress may have missed.
+    """
+    try:
+        enhanced_txs = await client.get_enhanced_transactions(target_wallet, limit=limit)
+    except Exception:
+        return []
+    if not enhanced_txs or not isinstance(enhanced_txs, list):
+        return []
+
+    signatures: List[str] = []
+    for etx in enhanced_txs:
+        sig = etx.get("signature")
+        if not sig:
+            continue
+        tx_type = etx.get("type", "")
+        if tx_type not in ("TRANSFER", "SWAP", "UNKNOWN"):
+            continue
+        token_transfers = etx.get("tokenTransfers") or []
+        native_transfers = etx.get("nativeTransfers") or []
+        is_incoming = False
+        for tt in token_transfers:
+            if tt.get("toUserAccount") == target_wallet:
+                mint = tt.get("mint", "")
+                if mint in allowed_spl_mints or mint == SOL_MINT:
+                    is_incoming = True
+                    break
+        if not is_incoming:
+            for nt in native_transfers:
+                if nt.get("toUserAccount") == target_wallet:
+                    is_incoming = True
+                    break
+        if is_incoming:
+            signatures.append(sig)
+    return signatures
 
 
 async def track_incoming_multi(
@@ -292,8 +362,6 @@ async def track_incoming_multi(
         new_checkpoint: Optional[str] = None
         collected: List[str] = []
         page_idx = 0
-        hit_checkpoint = False
-        lookback_remaining = CHECKPOINT_LOOKBACK
         while True:
             if max_pages is not None and page_idx >= max_pages:
                 break
@@ -311,18 +379,8 @@ async def track_incoming_multi(
                 if not signature:
                     continue
                 if checkpoint_sig and signature == checkpoint_sig:
-                    hit_checkpoint = True
-                    lookback_remaining -= 1
-                    continue
-                if hit_checkpoint:
-                    lookback_remaining -= 1
-                    collected.append(signature)
-                    if lookback_remaining <= 0:
-                        return collected, new_checkpoint
-                else:
-                    collected.append(signature)
-            if hit_checkpoint:
-                return collected, new_checkpoint
+                    return collected, new_checkpoint
+                collected.append(signature)
             before_sig = sigs[-1].get("signature")
             if not before_sig:
                 break
@@ -336,6 +394,14 @@ async def track_incoming_multi(
             )
             new_checkpoint_map[address] = new_checkpoint or checkpoint_map.get(address)
             signatures_to_process.extend(collected)
+
+        # Fallback: use Enhanced Transactions API to catch signatures that
+        # getSignaturesForAddress missed due to Helius indexing gaps.
+        if ENHANCED_TX_LIMIT > 0:
+            enhanced_sigs = await _discover_via_enhanced_api(
+                client, target_wallet, allowed_spl_mints, ENHANCED_TX_LIMIT
+            )
+            signatures_to_process.extend(enhanced_sigs)
 
         seen_sigs: set = set()
         unique_sigs: list = []
