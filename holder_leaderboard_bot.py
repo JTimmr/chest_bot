@@ -656,6 +656,7 @@ async def sync_donor_roles(guild: discord.Guild) -> Dict[str, int]:
         "failed_permission": 0,
         "skipped_nick": 0,
         "processed": 0,
+        "debug": [],
     }
     tiers = _fetch_tiers()
     base_role_name = _get_donor_config("base_role_name")
@@ -755,9 +756,16 @@ async def sync_donor_roles(guild: discord.Guild) -> Dict[str, int]:
         roles_to_add = set()
         roles_to_remove = set()
 
-        if base_role not in member.roles:
+        has_base = base_role in member.roles
+        has_tier = target_tier_role in member.roles
+        counts["debug"].append(
+            f"User {discord_id}: base={base_role.name}(id:{base_role.id}) "
+            f"has_base={has_base}, tier={target_tier_role.name}(id:{target_tier_role.id}) "
+            f"has_tier={has_tier}, member_roles={[(r.name, r.id) for r in member.roles if r.name != '@everyone']}"
+        )
+        if not has_base:
             roles_to_add.add(base_role)
-        if target_tier_role not in member.roles:
+        if not has_tier:
             roles_to_add.add(target_tier_role)
 
         for tr in tier_roles:
@@ -3764,6 +3772,10 @@ async def syncdonorroles(ctx: commands.Context):
             f"Failed (permission): {counts['failed_permission']}",
             f"Nickname skipped: {counts['skipped_nick']}",
         ]
+        if counts["debug"]:
+            parts.append("--- Debug ---")
+            for d in counts["debug"]:
+                parts.append(d)
         await ctx.send("\n".join(parts))
     except Exception as exc:
         log.exception("Manual donor role sync failed: %s", exc)
