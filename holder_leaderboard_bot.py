@@ -628,6 +628,7 @@ async def sync_donor_roles(guild: discord.Guild) -> Dict[str, int]:
         "skipped_tier": 0,
         "failed_permission": 0,
         "skipped_nick": 0,
+        "processed": 0,
     }
     tiers = _fetch_tiers()
     base_role_name = _get_donor_config("base_role_name")
@@ -705,6 +706,8 @@ async def sync_donor_roles(guild: discord.Guild) -> Dict[str, int]:
             counts["failed_permission"] += 1
             continue
 
+        counts["processed"] += 1
+
         roles_to_add = set()
         roles_to_remove = set()
 
@@ -721,6 +724,13 @@ async def sync_donor_roles(guild: discord.Guild) -> Dict[str, int]:
             if roles_to_remove:
                 await member.remove_roles(*roles_to_remove, reason="Donor tier update")
             if roles_to_add:
+                log.info(
+                    "Adding roles %s to %s (member has %d roles, is_owner=%s)",
+                    [r.name for r in roles_to_add],
+                    discord_id,
+                    len(member.roles),
+                    member.id == guild.owner_id,
+                )
                 await member.add_roles(*roles_to_add, reason="Donor tier update")
             if roles_to_add or roles_to_remove:
                 counts["updated"] += 1
@@ -3697,6 +3707,7 @@ async def syncdonorroles(ctx: commands.Context):
         counts = await sync_donor_roles(guild)
         parts = [
             f"Donor role sync complete.",
+            f"Processed: {counts['processed']}",
             f"Updated: {counts['updated']}",
             f"Skipped (1% not met): {counts['skipped_base']}",
             f"Skipped (no tier match): {counts['skipped_tier']}",
