@@ -711,8 +711,8 @@ async def sync_donor_roles(guild: discord.Guild) -> Dict[str, int]:
         roles_to_add = set()
         roles_to_remove = set()
 
-        log.info(
-            "Sync check for %s: base_role=%s (id=%s), tier_role=%s (id=%s), "
+        log.warning(
+            "DEBUG SYNC for %s: base_role=%s (id=%s), tier_role=%s (id=%s), "
             "member_role_ids=%s, member_role_names=%s",
             discord_id,
             base_role.name, base_role.id,
@@ -734,7 +734,7 @@ async def sync_donor_roles(guild: discord.Guild) -> Dict[str, int]:
             if roles_to_remove:
                 await member.remove_roles(*roles_to_remove, reason="Donor tier update")
             if roles_to_add:
-                log.info(
+                log.warning(
                     "Adding roles %s to %s (member has %d roles, is_owner=%s)",
                     [r.name for r in roles_to_add],
                     discord_id,
