@@ -374,6 +374,13 @@ def _ensure_donation_tiers_schema() -> None:
                 )
                 """
             )
+            existing_cols = {
+                row[1] for row in conn.execute("PRAGMA table_info(donation_tiers)")
+            }
+            if "role_id" not in existing_cols:
+                conn.execute(
+                    "ALTER TABLE donation_tiers ADD COLUMN role_id TEXT"
+                )
             conn.commit()
     except sqlite3.Error as exc:
         log.error("Failed to ensure donation_tiers schema: %s", exc)
@@ -468,7 +475,7 @@ def _set_donor_config(key: str, value: str) -> bool:
         return False
 
 
-def _add_tier(min_usd: float, emoji: str, role_name: str) -> int | None:
+def _add_tier(min_usd: float, emoji: str, role_name: str, role_id: str | None = None) -> int | None:
     try:
         with _connect_db(STATE_DB) as conn:
             row = conn.execute(
@@ -477,10 +484,10 @@ def _add_tier(min_usd: float, emoji: str, role_name: str) -> int | None:
             next_order = int(row[0] or 0) + 1 if row and row[0] is not None else 1
             cur = conn.execute(
                 """
-                INSERT INTO donation_tiers (min_usd, emoji, role_name, order_index, is_active)
-                VALUES (?, ?, ?, ?, 1)
+                INSERT INTO donation_tiers (min_usd, emoji, role_name, role_id, order_index, is_active)
+                VALUES (?, ?, ?, ?, ?, 1)
                 """,
-                (min_usd, emoji, role_name, next_order),
+                (min_usd, emoji, role_name, role_id, next_order),
             )
             conn.commit()
             return cur.lastrowid
@@ -557,6 +564,20 @@ def _canonical_role_name(guild: discord.Guild, stored: str) -> str:
     return role.name if role else stored
 
 
+def _resolve_role_by_id_or_name(
+    guild: discord.Guild, role_id: str | None, role_name: str
+) -> Optional[discord.Role]:
+    """Resolve a role using stored ID first (exact), falling back to name lookup."""
+    if role_id:
+        try:
+            role = guild.get_role(int(role_id))
+            if role:
+                return role
+        except (ValueError, TypeError):
+            pass
+    return _lookup_guild_role_by_name(guild, role_name)
+
+
 def _resolve_role_input(guild: discord.Guild, raw: str) -> Optional[str]:
     """Resolve user role input safely.
 
@@ -590,14 +611,26 @@ def _resolve_role_input(guild: discord.Guild, raw: str) -> Optional[str]:
 def _fetch_tiers() -> List[Dict]:
     try:
         with _connect_db(STATE_DB) as conn:
-            rows = conn.execute(
-                """
-                SELECT id, min_usd, emoji, role_name, order_index
-                FROM donation_tiers
-                WHERE is_active = 1
-                ORDER BY min_usd ASC
-                """
-            ).fetchall()
+            cols = {row[1] for row in conn.execute("PRAGMA table_info(donation_tiers)")}
+            has_role_id = "role_id" in cols
+            if has_role_id:
+                rows = conn.execute(
+                    """
+                    SELECT id, min_usd, emoji, role_name, order_index, role_id
+                    FROM donation_tiers
+                    WHERE is_active = 1
+                    ORDER BY min_usd ASC
+                    """
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT id, min_usd, emoji, role_name, order_index
+                    FROM donation_tiers
+                    WHERE is_active = 1
+                    ORDER BY min_usd ASC
+                    """
+                ).fetchall()
         return [
             {
                 "id": r[0],
@@ -605,6 +638,7 @@ def _fetch_tiers() -> List[Dict]:
                 "emoji": r[2],
                 "role_name": r[3],
                 "order_index": r[4],
+                "role_id": r[5] if has_role_id and len(r) > 5 else None,
             }
             for r in rows
         ]
@@ -721,40 +755,29 @@ async def sync_donor_roles(guild: discord.Guild) -> Dict[str, int]:
     }
     tiers = _fetch_tiers()
     base_role_name = _get_donor_config("base_role_name")
+    base_role_id = _get_donor_config("base_role_id")
     if not tiers or not base_role_name:
         return counts
 
-    base_role_name = _canonical_role_name(guild, base_role_name)
-    for t in tiers:
-        t["role_name"] = _canonical_role_name(guild, t["role_name"])
+    base_role = _resolve_role_by_id_or_name(guild, base_role_id, base_role_name)
+    if not base_role:
+        log.warning("Base donor role '%s' (id=%s) could not be resolved; skipping sync.", base_role_name, base_role_id)
+        return counts
 
-    tiers_desc = sorted(tiers, key=lambda t: t["min_usd"], reverse=True)
-    all_role_names = {base_role_name} | {t["role_name"] for t in tiers}
     known_emojis = [t["emoji"] for t in tiers]
 
-    role_map: Dict[str, discord.Role] = {}
-    for rn in all_role_names:
-        existing = _lookup_guild_role_by_name(guild, rn)
+    for t in tiers:
+        resolved = _resolve_role_by_id_or_name(guild, t.get("role_id"), t["role_name"])
+        t["_resolved_role"] = resolved
+        if resolved:
+            t["role_name"] = resolved.name
 
-        if existing:
-            role_map[rn] = existing
-            continue
-
-        log.warning(
-            "Configured donor role '%s' does not exist in guild. Skipping.",
-            rn,
-        )
-
-    base_role = role_map.get(base_role_name)
-    if not base_role:
-        log.warning("Base donor role '%s' could not be resolved; skipping sync.", base_role_name)
-        return counts
+    tiers_desc = sorted(tiers, key=lambda t: t["min_usd"], reverse=True)
 
     tier_roles = set()
     for t in tiers:
-        r = role_map.get(t["role_name"])
-        if r:
-            tier_roles.add(r)
+        if t.get("_resolved_role"):
+            tier_roles.add(t["_resolved_role"])
 
     try:
         with _connect_db(SNAPSHOT_DB) as conn:
@@ -783,7 +806,7 @@ async def sync_donor_roles(guild: discord.Guild) -> Dict[str, int]:
             counts["skipped_tier"] += 1
             continue
 
-        target_tier_role = role_map.get(target_tier["role_name"])
+        target_tier_role = target_tier.get("_resolved_role")
         if not target_tier_role:
             counts["skipped_tier"] += 1
             continue
@@ -857,7 +880,7 @@ async def sync_donor_roles(guild: discord.Guild) -> Dict[str, int]:
                     SET roles = ?
                     WHERE discord_id = ?
                     """,
-                    (f"{base_role_name},{target_tier['role_name']}", discord_id),
+                    (f"{base_role.name},{target_tier['role_name']}", discord_id),
                 )
                 conn.commit()
         except sqlite3.Error:
@@ -3688,14 +3711,16 @@ async def setbaserole(ctx: commands.Context, *, role_name: str = ""):
     """Set the base contributor role given to all qualifying donors."""
     if not role_name.strip():
         return await ctx.send("Usage: `!setbaserole <role_name>`\nExample: `!setbaserole Contributor`")
-    resolved = _resolve_role_input(ctx.guild, role_name.strip())
-    if resolved is None:
+    role = _lookup_guild_role_by_name(ctx.guild, role_name.strip())
+    if not role:
+        mention_match = re.match(r"<@&(\d+)>$", role_name.strip())
+        if mention_match:
+            role = ctx.guild.get_role(int(mention_match.group(1)))
+    if not role:
         return await ctx.send("Could not find that role in this server.")
-    success = _set_donor_config("base_role_name", resolved)
-    if success:
-        await ctx.send(f"Base donor role set to **{resolved}**.")
-    else:
-        await ctx.send("Failed to set base role. Check logs.")
+    _set_donor_config("base_role_name", role.name)
+    _set_donor_config("base_role_id", str(role.id))
+    await ctx.send(f"Base donor role set to **{role.name}** (id: {role.id}).")
 
 
 @bot.command(name="settier")
@@ -3712,14 +3737,18 @@ async def settier(ctx: commands.Context, min_usd: str = "", emoji: str = "", *, 
             return await ctx.send("Minimum USD must be zero or positive.")
     except ValueError:
         return await ctx.send("Invalid amount. Use a number like `100` or `250.00`.")
-    resolved = _resolve_role_input(ctx.guild, role_name.strip())
-    if resolved is None:
+    role = _lookup_guild_role_by_name(ctx.guild, role_name.strip())
+    if not role:
+        mention_match = re.match(r"<@&(\d+)>$", role_name.strip())
+        if mention_match:
+            role = ctx.guild.get_role(int(mention_match.group(1)))
+    if not role:
         return await ctx.send("Could not find that role in this server.")
-    tier_id = _add_tier(amount, emoji.strip(), resolved)
+    tier_id = _add_tier(amount, emoji.strip(), role.name, role_id=str(role.id))
     if tier_id is None:
         return await ctx.send("Failed to add tier. Check logs.")
     await ctx.send(
-        f"Tier #{tier_id} added: **${amount:,.2f}** — {emoji.strip()} **{resolved}**"
+        f"Tier #{tier_id} added: **${amount:,.2f}** — {emoji.strip()} **{role.name}** (id: {role.id})"
     )
 
 
@@ -3816,6 +3845,7 @@ async def syncdonorroles(ctx: commands.Context):
             for d in counts["debug"]:
                 parts.append(d)
         await ctx.send("\n".join(parts))
+        await bot._refresh_leaderboards()
     except Exception as exc:
         log.exception("Manual donor role sync failed: %s", exc)
         await ctx.send(f"Sync failed: {exc}")
