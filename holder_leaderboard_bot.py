@@ -2339,6 +2339,7 @@ def _command_channel_check(ctx: commands.Context) -> bool:
 
 intents = discord.Intents.default()
 intents.guilds = True
+intents.members = True
 intents.message_content = True
 
 bot = LeaderboardBot(intents=intents)
@@ -3706,6 +3707,146 @@ async def syncdonorroles(ctx: commands.Context):
     except Exception as exc:
         log.exception("Manual donor role sync failed: %s", exc)
         await ctx.send(f"Sync failed: {exc}")
+
+
+@bot.command(name="donorstats")
+async def donorstats(ctx: commands.Context, min_usd: str = ""):
+    """Show donation statistics. Optionally filter by minimum USD: !donorstats <min_usd>"""
+    try:
+        with _connect_db(SNAPSHOT_DB) as conn:
+            total_verified = conn.execute(
+                f"SELECT COUNT(*) FROM {SUMMARY_TABLE} WHERE discord_id IS NOT NULL"
+            ).fetchone()[0]
+
+            total_wallets = conn.execute(
+                f"SELECT COUNT(*) FROM {SNAPSHOT_TABLE}"
+            ).fetchone()[0]
+
+            verified_wallets = conn.execute(
+                f"SELECT COUNT(*) FROM {SNAPSHOT_TABLE} WHERE discord_id IS NOT NULL"
+            ).fetchone()[0]
+
+            unverified_wallets = total_wallets - verified_wallets
+
+            donors = conn.execute(
+                f"SELECT COUNT(*) FROM {SUMMARY_TABLE} WHERE discord_id IS NOT NULL AND total_donated_usd > 0"
+            ).fetchone()[0]
+
+            total_donated = conn.execute(
+                f"SELECT COALESCE(SUM(total_donated_usd), 0) FROM {SUMMARY_TABLE} WHERE discord_id IS NOT NULL"
+            ).fetchone()[0]
+
+            eligible = conn.execute(
+                f"""SELECT COUNT(DISTINCT s.discord_id)
+                    FROM {SNAPSHOT_TABLE} s
+                    WHERE s.discord_id IS NOT NULL
+                      AND s.amount_fartboy > 0
+                      AND s.donated_fartboy >= s.amount_fartboy * 0.01"""
+            ).fetchone()[0]
+
+            lines = [
+                "**Donation & Verification Stats**",
+                f"Verified members: **{total_verified}**",
+                f"Verified wallets: **{verified_wallets}**",
+                f"Unverified wallets: **{unverified_wallets}**",
+                f"Members who donated: **{donors}**",
+                f"Members meeting 1% threshold: **{eligible}**",
+                f"Total donated (USD): **${total_donated:,.2f}**",
+            ]
+
+            if min_usd.strip():
+                try:
+                    threshold = float(min_usd)
+                    above = conn.execute(
+                        f"SELECT COUNT(*) FROM {SUMMARY_TABLE} WHERE discord_id IS NOT NULL AND total_donated_usd >= ?",
+                        (threshold,),
+                    ).fetchone()[0]
+                    lines.append(f"Members donated >= ${threshold:,.2f}: **{above}**")
+                except ValueError:
+                    lines.append(f"(Invalid threshold `{min_usd}` — provide a number)")
+
+        await ctx.send("\n".join(lines))
+    except sqlite3.Error as exc:
+        log.error("donorstats failed: %s", exc)
+        await ctx.send("Failed to fetch stats. Check logs.")
+
+
+@bot.command(name="walletsummary")
+async def walletsummary(ctx: commands.Context):
+    """Show a breakdown of wallet verification status and holdings."""
+    try:
+        with _connect_db(SNAPSHOT_DB) as conn:
+            total_wallets = conn.execute(
+                f"SELECT COUNT(*) FROM {SNAPSHOT_TABLE}"
+            ).fetchone()[0]
+
+            verified_wallets = conn.execute(
+                f"SELECT COUNT(*) FROM {SNAPSHOT_TABLE} WHERE discord_id IS NOT NULL"
+            ).fetchone()[0]
+
+            total_holdings = conn.execute(
+                f"SELECT COALESCE(SUM(amount_fartboy), 0) FROM {SNAPSHOT_TABLE}"
+            ).fetchone()[0]
+
+            verified_holdings = conn.execute(
+                f"SELECT COALESCE(SUM(amount_fartboy), 0) FROM {SNAPSHOT_TABLE} WHERE discord_id IS NOT NULL"
+            ).fetchone()[0]
+
+            total_donated_tokens = conn.execute(
+                f"SELECT COALESCE(SUM(donated_fartboy), 0) FROM {SNAPSHOT_TABLE}"
+            ).fetchone()[0]
+
+            pct_wallets = (verified_wallets / total_wallets * 100) if total_wallets else 0
+            pct_holdings = (verified_holdings / total_holdings * 100) if total_holdings else 0
+
+            lines = [
+                "**Wallet Summary**",
+                f"Total wallets in snapshot: **{total_wallets:,}**",
+                f"Verified: **{verified_wallets:,}** ({pct_wallets:.1f}%)",
+                f"Unverified: **{total_wallets - verified_wallets:,}**",
+                "",
+                f"Total holdings: **{total_holdings:,.0f}** FARTBOY",
+                f"Verified holdings: **{verified_holdings:,.0f}** ({pct_holdings:.1f}%)",
+                f"Total donated (tokens): **{total_donated_tokens:,.0f}** FARTBOY",
+            ]
+
+        await ctx.send("\n".join(lines))
+    except sqlite3.Error as exc:
+        log.error("walletsummary failed: %s", exc)
+        await ctx.send("Failed to fetch wallet summary. Check logs.")
+
+
+@bot.command(name="donortop")
+async def donortop(ctx: commands.Context, count: str = "10"):
+    """Show top donors by USD donated. Usage: !donortop [count]"""
+    try:
+        limit = min(max(int(count), 1), 25)
+    except ValueError:
+        limit = 10
+
+    try:
+        with _connect_db(SNAPSHOT_DB) as conn:
+            rows = conn.execute(
+                f"""SELECT discord_name, total_donated_usd
+                    FROM {SUMMARY_TABLE}
+                    WHERE discord_id IS NOT NULL AND total_donated_usd > 0
+                    ORDER BY total_donated_usd DESC
+                    LIMIT ?""",
+                (limit,),
+            ).fetchall()
+
+        if not rows:
+            return await ctx.send("No donations recorded yet.")
+
+        lines = [f"**Top {len(rows)} Donors (by USD)**"]
+        for i, (name, usd) in enumerate(rows, 1):
+            display = name or "Anonymous"
+            lines.append(f"{i}. {display} — **${float(usd):,.2f}**")
+
+        await ctx.send("\n".join(lines))
+    except sqlite3.Error as exc:
+        log.error("donortop failed: %s", exc)
+        await ctx.send("Failed to fetch top donors. Check logs.")
 
 
 @setbaserole.error
