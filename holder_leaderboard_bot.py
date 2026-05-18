@@ -711,6 +711,16 @@ async def sync_donor_roles(guild: discord.Guild) -> Dict[str, int]:
         roles_to_add = set()
         roles_to_remove = set()
 
+        log.info(
+            "Sync check for %s: base_role=%s (id=%s), tier_role=%s (id=%s), "
+            "member_role_ids=%s, member_role_names=%s",
+            discord_id,
+            base_role.name, base_role.id,
+            target_tier_role.name, target_tier_role.id,
+            [r.id for r in member.roles],
+            [r.name for r in member.roles],
+        )
+
         if base_role not in member.roles:
             roles_to_add.add(base_role)
         if target_tier_role not in member.roles:
