@@ -56,7 +56,6 @@ STATE_DB = os.getenv("LEADERBOARD_STATE_DB", "/app/data/leaderboard_state.db")
 UPDATE_SECONDS = int(os.getenv("LEADERBOARD_UPDATE_SECONDS", "300"))
 DEFAULT_LIMIT = 30
 GUILD_ID = os.getenv("DISCORD_GUILD_ID")
-ENABLE_DM_COMMANDS = os.getenv("ENABLE_DM_COMMANDS", "").lower() in {"1", "true", "yes"}
 SNAPSHOT_WATCH_SECONDS = int(os.getenv("SNAPSHOT_WATCH_SECONDS", "10"))
 LEADERBOARD_REFRESH_COOLDOWN = int(os.getenv("LEADERBOARD_REFRESH_COOLDOWN_SECONDS", "10"))
 TRACKER_INTERVAL_SECONDS = int(os.getenv("TRACKER_INTERVAL_SECONDS", "120"))
@@ -132,53 +131,6 @@ def _ensure_summary_schema() -> None:
             conn.commit()
     except sqlite3.Error as exc:
         log.error("Failed to ensure summary schema: %s", exc)
-
-
-def _ensure_dm_state_schema() -> None:
-    try:
-        with _connect_db(SNAPSHOT_DB) as conn:
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS dm_state (
-                    discord_id TEXT PRIMARY KEY,
-                    intro_sent INTEGER NOT NULL DEFAULT 0,
-                    intro_sent_at TEXT
-                )
-                """
-            )
-            conn.commit()
-    except sqlite3.Error as exc:
-        log.error("Failed to ensure DM state schema: %s", exc)
-
-
-def _has_sent_intro_dm(discord_id: str) -> bool:
-    try:
-        with _connect_db(SNAPSHOT_DB) as conn:
-            row = conn.execute(
-                "SELECT intro_sent FROM dm_state WHERE discord_id = ?",
-                (discord_id,),
-            ).fetchone()
-        return bool(row and int(row[0] or 0) == 1)
-    except sqlite3.Error:
-        return False
-
-
-def _mark_intro_dm_sent(discord_id: str) -> None:
-    try:
-        with _connect_db(SNAPSHOT_DB) as conn:
-            conn.execute(
-                """
-                INSERT INTO dm_state (discord_id, intro_sent, intro_sent_at)
-                VALUES (?, 1, datetime('now'))
-                ON CONFLICT(discord_id) DO UPDATE SET
-                    intro_sent = 1,
-                    intro_sent_at = datetime('now')
-                """,
-                (discord_id,),
-            )
-            conn.commit()
-    except sqlite3.Error as exc:
-        log.error("Failed to mark intro DM sent: %s", exc)
 
 
 def _ensure_live_state_schema() -> None:
@@ -664,12 +616,23 @@ def _build_tier_nickname(base_name: str, emoji: str | None, known_emojis: List[s
     return candidate
 
 
-async def sync_donor_roles(guild: discord.Guild) -> None:
-    """Sync donor roles and nickname emojis for all verified users."""
+async def sync_donor_roles(guild: discord.Guild) -> Dict[str, int]:
+    """Sync donor roles and nickname emojis for all verified users.
+
+    Returns a dict with counts: updated, skipped_base, skipped_tier,
+    failed_permission, skipped_nick.
+    """
+    counts = {
+        "updated": 0,
+        "skipped_base": 0,
+        "skipped_tier": 0,
+        "failed_permission": 0,
+        "skipped_nick": 0,
+    }
     tiers = _fetch_tiers()
     base_role_name = _get_donor_config("base_role_name")
     if not tiers or not base_role_name:
-        return
+        return counts
 
     tiers_desc = sorted(tiers, key=lambda t: t["min_usd"], reverse=True)
     all_role_names = {base_role_name} | {t["role_name"] for t in tiers}
@@ -690,7 +653,7 @@ async def sync_donor_roles(guild: discord.Guild) -> None:
     base_role = role_map.get(base_role_name)
     if not base_role:
         log.warning("Base donor role '%s' could not be resolved; skipping sync.", base_role_name)
-        return
+        return counts
 
     tier_roles = set()
     for t in tiers:
@@ -705,32 +668,29 @@ async def sync_donor_roles(guild: discord.Guild) -> None:
             ).fetchall()
     except sqlite3.Error as exc:
         log.error("Failed to load verified users for role sync: %s", exc)
-        return
-
-    ranked = sorted(users, key=lambda u: float(u[1] or 0), reverse=True)
-    top5_ids = {str(u[0]) for u in ranked[:5] if float(u[1] or 0) > 0}
+        return counts
 
     for discord_id, total_donated_usd in users:
         discord_id = str(discord_id)
         donated_usd = float(total_donated_usd or 0)
 
         if not _check_base_eligibility(discord_id):
+            counts["skipped_base"] += 1
             continue
 
-        if discord_id in top5_ids and tiers_desc:
-            target_tier = tiers_desc[0]
-        else:
-            target_tier = None
-            for t in tiers_desc:
-                if donated_usd >= t["min_usd"]:
-                    target_tier = t
-                    break
+        target_tier = None
+        for t in tiers_desc:
+            if donated_usd >= t["min_usd"]:
+                target_tier = t
+                break
 
         if not target_tier:
+            counts["skipped_tier"] += 1
             continue
 
         target_tier_role = role_map.get(target_tier["role_name"])
         if not target_tier_role:
+            counts["skipped_tier"] += 1
             continue
 
         try:
@@ -739,8 +699,10 @@ async def sync_donor_roles(guild: discord.Guild) -> None:
                 try:
                     member = await guild.fetch_member(int(discord_id))
                 except discord.HTTPException:
+                    counts["failed_permission"] += 1
                     continue
         except (ValueError, discord.HTTPException):
+            counts["failed_permission"] += 1
             continue
 
         roles_to_add = set()
@@ -760,8 +722,11 @@ async def sync_donor_roles(guild: discord.Guild) -> None:
                 await member.remove_roles(*roles_to_remove, reason="Donor tier update")
             if roles_to_add:
                 await member.add_roles(*roles_to_add, reason="Donor tier update")
+            if roles_to_add or roles_to_remove:
+                counts["updated"] += 1
         except discord.HTTPException as exc:
             log.warning("Failed to update roles for %s: %s", discord_id, exc)
+            counts["failed_permission"] += 1
 
         target_nick = _build_tier_nickname(
             member.display_name, target_tier["emoji"], known_emojis
@@ -771,6 +736,7 @@ async def sync_donor_roles(guild: discord.Guild) -> None:
                 await member.edit(nick=target_nick, reason="Donor tier emoji")
             except discord.HTTPException as exc:
                 log.warning("Failed to set nickname for %s: %s", discord_id, exc)
+                counts["skipped_nick"] += 1
 
         try:
             with _connect_db(SNAPSHOT_DB) as conn:
@@ -787,6 +753,7 @@ async def sync_donor_roles(guild: discord.Guild) -> None:
             pass
 
         await asyncio.sleep(0.5)
+    return counts
 
 
 def _fetch_total_by_token() -> Dict[str, float]:
@@ -917,52 +884,6 @@ def _format_remaining(assigned_at: Optional[str]) -> str:
     minutes = remaining // 60
     seconds = remaining % 60
     return f"{minutes}m {seconds}s"
-
-
-async def _send_first_dm_extras(user: discord.User) -> None:
-    _ensure_dm_state_schema()
-    discord_id = str(user.id)
-    if _has_sent_intro_dm(discord_id):
-        return
-    war_chest = os.getenv("WARCHEST_ADDRESS", "").strip()
-    try:
-        await user.send("War chest address:")
-        await user.send(war_chest or "War chest address is not configured.")
-        await user.send("Quick commands:", view=VerificationButtonsDMView())
-        _mark_intro_dm_sent(discord_id)
-    except discord.HTTPException:
-        log.warning("Failed to send intro DM extras for discord id %s", discord_id)
-
-
-async def _send_dm_with_intro(user: discord.User, message: str) -> None:
-    await user.send(message)
-    await _send_first_dm_extras(user)
-
-
-def _welcome_message_text() -> str:
-    return (
-        "Welcome! This bot helps you verify your wallet and track donations.\n\n"
-        "Start with /verifywallet to get a small verification amount to send to the war chest. "
-        "After sending, use /verifystatus to check your verification.\n\n"
-        "Other helpful commands: /mywallets, /mytransactions, /leaderboard, "
-        "/leaderboardvisibility."
-    )
-
-
-async def _send_full_welcome_dm(user: discord.User) -> bool:
-    _ensure_dm_state_schema()
-    discord_id = str(user.id)
-    war_chest = os.getenv("WARCHEST_ADDRESS", "").strip()
-    try:
-        await user.send(_welcome_message_text())
-        await user.send("War chest address:")
-        await user.send(war_chest or "War chest address is not configured.")
-        await user.send("Quick commands:", view=VerificationButtonsDMView())
-        _mark_intro_dm_sent(discord_id)
-        return True
-    except discord.HTTPException:
-        log.warning("Failed to send full welcome DM for discord id %s", discord_id)
-        return False
 
 
 def _is_leaderboard_visible(discord_id: str) -> bool:
@@ -1238,6 +1159,63 @@ def _discord_id_for_wallet(wallet: str) -> str | None:
         return row[0] if row and row[0] else None
     except sqlite3.Error:
         return None
+
+
+def _sync_snapshot_donations(
+    snapshot_conn: sqlite3.Connection,
+    tx_conn: sqlite3.Connection,
+    snapshot_table: str,
+    tx_table: str,
+    sender_wallet: str,
+) -> None:
+    """Ensure snapshot donated_fartboy/donated_usd reflect tx aggregates.
+
+    Called when !addtransaction re-attributes an existing tx row so
+    _apply_donations was not run.  Sets snapshot values to the max of
+    existing snapshot values and the tx-table aggregates for the wallet.
+    """
+    try:
+        tx_row = tx_conn.execute(
+            f"""
+            SELECT COALESCE(SUM(value_fartboy), 0),
+                   COALESCE(SUM(value_usdc), 0)
+            FROM {tx_table}
+            WHERE sender_wallet = ?
+            """,
+            (sender_wallet,),
+        ).fetchone()
+        if not tx_row:
+            return
+        tx_fartboy = float(tx_row[0] or 0)
+        tx_usd = float(tx_row[1] or 0)
+
+        snap_row = snapshot_conn.execute(
+            f"""
+            SELECT donated_fartboy, donated_usd
+            FROM {snapshot_table}
+            WHERE wallet_address = ?
+            """,
+            (sender_wallet,),
+        ).fetchone()
+        if not snap_row:
+            return
+        snap_fartboy = float(snap_row[0] or 0)
+        snap_usd = float(snap_row[1] or 0)
+
+        new_fartboy = max(snap_fartboy, tx_fartboy)
+        new_usd = max(snap_usd, tx_usd)
+        if new_fartboy > snap_fartboy or new_usd > snap_usd:
+            snapshot_conn.execute(
+                f"""
+                UPDATE {snapshot_table}
+                SET donated_fartboy = ?, donated_usd = ?
+                WHERE wallet_address = ?
+                """,
+                (new_fartboy, new_usd, sender_wallet),
+            )
+            snapshot_conn.commit()
+    except sqlite3.Error as exc:
+        log.warning("Failed to sync snapshot donations for %s: %s", sender_wallet, exc)
 
 
 def _recompute_summary_for_discord_id(discord_id: str) -> None:
@@ -1589,6 +1567,14 @@ async def _process_signature(signature: str, discord_id: str | None = None) -> T
                     row["sender_wallet"],
                     value_fartboy,
                     value_usdc,
+                )
+            elif row_discord_id:
+                _sync_snapshot_donations(
+                    snapshot_conn,
+                    tx_conn,
+                    SNAPSHOT_TABLE,
+                    TX_TABLE,
+                    row["sender_wallet"],
                 )
             if row_discord_id:
                 tx_conn.execute(
@@ -2168,145 +2154,6 @@ class VerificationButtonsView(discord.ui.View):
     ):
         await leaderboard_full.callback(interaction)
 
-    @discord.ui.button(
-        label="Open DM",
-        style=discord.ButtonStyle.secondary,
-        custom_id="open_dm_button",
-        row=4,
-    )
-    async def open_dm_button(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
-        success = await _send_full_welcome_dm(interaction.user)
-        if success:
-            await interaction.response.send_message(
-                "Check your DMs for the welcome info and buttons.",
-                ephemeral=True,
-            )
-        else:
-            await interaction.response.send_message(
-                "I couldn't DM you. Please enable DMs for this server and try again.",
-                ephemeral=True,
-            )
-
-
-class VerificationButtonsDMView(discord.ui.View):
-    def __init__(self) -> None:
-        super().__init__(timeout=None)
-
-    @discord.ui.button(
-        label="Verify wallet",
-        style=discord.ButtonStyle.primary,
-        custom_id="verify_wallet_button_dm",
-        row=0,
-    )
-    async def verify_wallet_button(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
-        await verify_wallet_otp.callback(interaction)
-
-    @discord.ui.button(
-        label="Verify status",
-        style=discord.ButtonStyle.secondary,
-        custom_id="verify_status_button_dm",
-        row=1,
-    )
-    async def verify_status_button(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
-        await verify_status.callback(interaction)
-
-    @discord.ui.button(
-        label="My wallets",
-        style=discord.ButtonStyle.secondary,
-        custom_id="my_wallets_button_dm",
-        row=1,
-    )
-    async def my_wallets_button(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
-        await my_wallets.callback(interaction)
-
-    @discord.ui.button(
-        label="My transactions",
-        style=discord.ButtonStyle.secondary,
-        custom_id="my_transactions_button_dm",
-        row=1,
-    )
-    async def my_transactions_button(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
-        await my_transactions.callback(interaction)
-
-    @discord.ui.button(
-        label="Become visible",
-        style=discord.ButtonStyle.success,
-        custom_id="become_visible_button_dm",
-        row=2,
-    )
-    async def become_visible_button(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
-        discord_id = str(interaction.user.id)
-        if not _find_wallets_for_discord_id(discord_id):
-            return await interaction.response.send_message(
-                "No verified wallet found. Use the Verify wallet button first.",
-                ephemeral=True,
-            )
-        if _is_leaderboard_visible(discord_id):
-            return await interaction.response.send_message(
-                "You are already visible on the leaderboard.",
-                ephemeral=True,
-            )
-        _update_visibility_by_discord(discord_id, str(interaction.user), 1)
-        _set_summary_visibility(discord_id, 1)
-        _recompute_summary_for_discord_id(discord_id)
-        await interaction.response.send_message(
-            "Your name is now **visible** on the leaderboard. You can change this anytime.",
-            ephemeral=True,
-        )
-        await bot._refresh_leaderboards()
-
-    @discord.ui.button(
-        label="Become anonymous",
-        style=discord.ButtonStyle.danger,
-        custom_id="become_anonymous_button_dm",
-        row=2,
-    )
-    async def become_anonymous_button(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
-        discord_id = str(interaction.user.id)
-        if not _find_wallets_for_discord_id(discord_id):
-            return await interaction.response.send_message(
-                "No verified wallet found. Use the Verify wallet button first.",
-                ephemeral=True,
-            )
-        if not _is_leaderboard_visible(discord_id):
-            return await interaction.response.send_message(
-                "You are already anonymous on the leaderboard.",
-                ephemeral=True,
-            )
-        _update_visibility_by_discord(discord_id, str(interaction.user), 0)
-        _set_summary_visibility(discord_id, 0)
-        _recompute_summary_for_discord_id(discord_id)
-        await interaction.response.send_message(
-            "You are now **anonymous** on the leaderboard. Your donations show as 'Anonymous donor'.",
-            ephemeral=True,
-        )
-        await bot._refresh_leaderboards()
-
-    @discord.ui.button(
-        label="Full leaderboard",
-        style=discord.ButtonStyle.secondary,
-        custom_id="full_leaderboard_button_dm",
-        row=3,
-    )
-    async def full_leaderboard_button(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
-        await leaderboard_full.callback(interaction)
-
 
 class LeaderboardBot(commands.Bot):
     def __init__(self, **kwargs):
@@ -2323,7 +2170,6 @@ class LeaderboardBot(commands.Bot):
         _ensure_snapshot_tables()
         _ensure_snapshot_schema()
         _ensure_summary_schema()
-        _ensure_dm_state_schema()
         _ensure_live_state_schema()
         _ensure_otp_schema()
         _ensure_exchange_wallets_schema()
@@ -2357,36 +2203,18 @@ class LeaderboardBot(commands.Bot):
         if self._tracker and self._live_enabled:
             self._tracker.unlimited_backfill = True
         if GUILD_ID:
-            if ENABLE_DM_COMMANDS:
-                # Avoid duplicate commands in guild by using global commands only.
-                guild = discord.Object(id=int(GUILD_ID))
-                self.tree.clear_commands(guild=guild)
-                await self.tree.sync(guild=guild)
-                self.tree.clear_commands(guild=None)
-                self.tree.add_command(set_leaderboard_visibility)
-                self.tree.add_command(my_transactions)
-                self.tree.add_command(my_wallets)
-                self.tree.add_command(verify_wallet_otp)
-                self.tree.add_command(verify_status)
-                self.tree.add_command(leaderboard_full)
-                self.tree.add_command(dm_welcome)
-                await self.tree.sync()
-                log.info("Slash commands synced globally (DMs enabled).")
-            else:
-                # Clear any global commands to avoid duplicates or stale commands.
-                self.tree.clear_commands(guild=None)
-                await self.tree.sync()
-                guild = discord.Object(id=int(GUILD_ID))
-                self.tree.clear_commands(guild=guild)
-                self.tree.add_command(set_leaderboard_visibility, guild=guild)
-                self.tree.add_command(my_transactions, guild=guild)
-                self.tree.add_command(my_wallets, guild=guild)
-                self.tree.add_command(verify_wallet_otp, guild=guild)
-                self.tree.add_command(verify_status, guild=guild)
-                self.tree.add_command(leaderboard_full, guild=guild)
-                self.tree.add_command(dm_welcome, guild=guild)
-                await self.tree.sync(guild=guild)
-                log.info("Slash commands synced to guild %s", GUILD_ID)
+            self.tree.clear_commands(guild=None)
+            await self.tree.sync()
+            guild = discord.Object(id=int(GUILD_ID))
+            self.tree.clear_commands(guild=guild)
+            self.tree.add_command(set_leaderboard_visibility, guild=guild)
+            self.tree.add_command(my_transactions, guild=guild)
+            self.tree.add_command(my_wallets, guild=guild)
+            self.tree.add_command(verify_wallet_otp, guild=guild)
+            self.tree.add_command(verify_status, guild=guild)
+            self.tree.add_command(leaderboard_full, guild=guild)
+            await self.tree.sync(guild=guild)
+            log.info("Slash commands synced to guild %s", GUILD_ID)
         else:
             self.tree.add_command(set_leaderboard_visibility)
             self.tree.add_command(my_transactions)
@@ -2394,7 +2222,6 @@ class LeaderboardBot(commands.Bot):
             self.tree.add_command(verify_wallet_otp)
             self.tree.add_command(verify_status)
             self.tree.add_command(leaderboard_full)
-            self.tree.add_command(dm_welcome)
             await self.tree.sync()
         self.update_leaderboard.start()
         self.watch_snapshot_changes.start()
@@ -2466,7 +2293,7 @@ class LeaderboardBot(commands.Bot):
             discord_ids = {did for w in wallets if (did := _discord_id_for_wallet(w))}
             for did in discord_ids:
                 _recompute_summary_for_discord_id(did)
-            if count > 0 and GUILD_ID:
+            if (count > 0 or verified_ids) and GUILD_ID:
                 guild = self.get_guild(int(GUILD_ID))
                 if guild:
                     await sync_donor_roles(guild)
@@ -2561,18 +2388,30 @@ async def checkwallet(ctx: commands.Context, wallet: str = ""):
     description="Show recent transactions for the wallet linked to your Discord user.",
 )
 async def my_transactions(interaction: discord.Interaction):
-    wallets = _find_wallets_for_discord_id(str(interaction.user.id))
-    rows = _fetch_transactions_for_wallets(wallets, TX_LOOKUP_LIMIT)
-    if not rows:
-        rows = _fetch_transactions_for_discord_id(
-            str(interaction.user.id), TX_LOOKUP_LIMIT
-        )
-    if not rows:
+    discord_id_str = str(interaction.user.id)
+    wallets = _find_wallets_for_discord_id(discord_id_str)
+    wallet_rows = _fetch_transactions_for_wallets(wallets, TX_LOOKUP_LIMIT)
+    attributed_rows = _fetch_transactions_for_discord_id(discord_id_str, TX_LOOKUP_LIMIT)
+    seen_keys: set = set()
+    merged: list = []
+    for row in wallet_rows:
+        key = (row.get("timestamp"), row.get("wallet"), row.get("token"), row.get("amount_ui"))
+        if key not in seen_keys:
+            seen_keys.add(key)
+            merged.append(row)
+    for row in attributed_rows:
+        key = (row.get("timestamp"), row.get("wallet"), row.get("token"), row.get("amount_ui"))
+        if key not in seen_keys:
+            seen_keys.add(key)
+            merged.append(row)
+    merged.sort(key=lambda r: r.get("timestamp") or "", reverse=True)
+    if not merged:
         return await interaction.response.send_message(
             "No transactions found for your wallet.",
             ephemeral=True,
         )
     total_usd = 0.0
+    total_fartboy = 0.0
     total_holdings = 0.0
     try:
         with _connect_db(SNAPSHOT_DB) as conn:
@@ -2590,19 +2429,20 @@ async def my_transactions(interaction: discord.Interaction):
     except sqlite3.Error:
         total_holdings = 0.0
     lines = []
-    for row in rows[:50]:
+    for row in merged[:50]:
         lines.append(
             f"{row['timestamp']} | {row['amount_ui']} {row['token']} | "
             f"${row['value_usdc']:.6f}"
         )
         total_usd += float(row["value_usdc"] or 0)
+        total_fartboy += float(row.get("value_fartboy") or 0)
     body = "\n".join(lines)
     total_pct = 0.0
     if total_holdings > 0:
-        total_pct = (total_usd / total_holdings) * 100.0
+        total_pct = (total_fartboy / total_holdings) * 100.0
     await interaction.response.send_message(
         f"Transactions from your linked wallet(s):\n```\n{body}\n```\n"
-        f"Total donated: ${total_usd:,.6f} ({total_pct:.4f}% of holdings)",
+        f"Total donated: ${total_usd:,.2f} | {total_pct:.2f}% toward 1% FARTBOY requirement",
         ephemeral=True,
     )
 
@@ -2620,13 +2460,14 @@ async def my_wallets(interaction: discord.Interaction):
         )
     lines = []
     total_usd = 0.0
+    total_donated_fartboy = 0.0
     total_holdings = 0.0
     for wallet in wallets:
         try:
             with _connect_db(SNAPSHOT_DB) as conn:
                 row = conn.execute(
                     f"""
-                    SELECT donated_usd, amount_fartboy
+                    SELECT donated_usd, amount_fartboy, donated_fartboy
                     FROM {SNAPSHOT_TABLE}
                     WHERE wallet_address = ?
                     """,
@@ -2634,21 +2475,25 @@ async def my_wallets(interaction: discord.Interaction):
                 ).fetchone()
             donated_usd = float(row[0] or 0) if row else 0.0
             holdings = float(row[1] or 0) if row else 0.0
+            donated_fb = float(row[2] or 0) if row else 0.0
         except sqlite3.Error:
             donated_usd = 0.0
             holdings = 0.0
+            donated_fb = 0.0
         total_usd += donated_usd
+        total_donated_fartboy += donated_fb
         total_holdings += holdings
 
         pct = 0.0
         if holdings > 0:
-            pct = (donated_usd / holdings) * 100.0
-        lines.append(f"{wallet} | ${donated_usd:,.6f} | {pct:.4f}%")
+            pct = (donated_fb / holdings) * 100.0
+        short_wallet = f"{wallet[:6]}...{wallet[-4:]}" if len(wallet) > 14 else wallet
+        lines.append(f"{short_wallet} | ${donated_usd:,.2f} | {pct:.2f}% toward 1%")
 
     total_pct = 0.0
     if total_holdings > 0:
-        total_pct = (total_usd / total_holdings) * 100.0
-    lines.append(f"Total | ${total_usd:,.6f} | {total_pct:.4f}%")
+        total_pct = (total_donated_fartboy / total_holdings) * 100.0
+    lines.append(f"Total | ${total_usd:,.2f} | {total_pct:.2f}% toward 1%")
     body = "\n".join(lines)
     await interaction.response.send_message(
         f"Your verified wallets and donations:\n```\n{body}\n```",
@@ -2715,10 +2560,12 @@ async def verify_wallet_otp(interaction: discord.Interaction):
 
 @app_commands.command(
     name="verifystatus",
-    description="Show your verification status (pending, used, expired).",
+    description="Show your verification status.",
 )
 async def verify_status(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
+    discord_id = str(interaction.user.id)
+
     if bot._tracker:
         try:
             count, wallets, verified_ids = await bot._tracker.run_once()
@@ -2731,6 +2578,12 @@ async def verify_status(interaction: discord.Interaction):
                 log.info("On-demand tracker run found %s new transactions.", count)
         except Exception as exc:
             log.warning("On-demand tracker run failed: %s", exc)
+
+    verified_wallets = _find_wallets_for_discord_id(discord_id)
+
+    pending = None
+    rows = []
+    rejections = []
     try:
         with _connect_db(SNAPSHOT_DB) as conn:
             _ensure_otp_registry(conn)
@@ -2744,7 +2597,7 @@ async def verify_status(interaction: discord.Interaction):
                 ORDER BY assigned_at DESC
                 LIMIT 1
                 """,
-                (str(interaction.user.id),),
+                (discord_id,),
             ).fetchone()
             rows = conn.execute(
                 f"""
@@ -2753,47 +2606,8 @@ async def verify_status(interaction: discord.Interaction):
                 WHERE assigned_to_discord_id = ?
                 ORDER BY assigned_at DESC
                 """,
-                (str(interaction.user.id),),
+                (discord_id,),
             ).fetchall()
-    except sqlite3.Error:
-        rows = []
-
-    if not rows:
-        message = "No verification records found. Use /verifywallet to start."
-        if not _is_leaderboard_visible(str(interaction.user.id)):
-            message += "\n\n" + _reminder_text()
-        return await interaction.followup.send(message, ephemeral=True)
-
-    war_chest = os.getenv("WARCHEST_ADDRESS", "")
-    lines = []
-    if pending:
-        otp_value, tick_size, assigned_at = pending
-        remaining = _format_remaining(assigned_at)
-        await interaction.followup.send(
-            "Your active verification amount:\n"
-            f"```\n{otp_value}\n```\n"
-            "Send to:\n"
-            f"```\n{war_chest}\n```\n"
-            f"Expires in {remaining} (tick size {tick_size} decimals).",
-            ephemeral=True,
-        )
-
-    for otp_value, tick_size, status, assigned_at, used_at, tx_signature in rows:
-        status_text = status or "unknown"
-        ts = _discord_time_from_sqlite(used_at or assigned_at)
-        sig = f"tx {tx_signature[:12]}…" if tx_signature else "tx none"
-        lines.append(
-            f"- {otp_value} ({tick_size} decimals) | {status_text} | {ts} | {sig}"
-        )
-
-    body = "\n".join(lines[:50])
-    await interaction.followup.send(
-        f"Your verification history:\n{body}",
-        ephemeral=True,
-    )
-
-    try:
-        with _connect_db(SNAPSHOT_DB) as conn:
             rejections = conn.execute(
                 """
                 SELECT reason, sender_wallet, created_at
@@ -2802,21 +2616,129 @@ async def verify_status(interaction: discord.Interaction):
                 ORDER BY created_at DESC
                 LIMIT 5
                 """,
-                (str(interaction.user.id),),
+                (discord_id,),
             ).fetchall()
-            if rejections:
-                rej_lines = []
-                for reason, wallet, created_at in rejections:
-                    short_wallet = f"{wallet[:6]}...{wallet[-4:]}" if wallet and len(wallet) > 10 else (wallet or "?")
-                    rej_lines.append(f"- {reason} | wallet {short_wallet} | {created_at}")
-                await interaction.followup.send(
-                    "Recent verification rejections (strict mode):\n" + "\n".join(rej_lines),
-                    ephemeral=True,
-                )
     except sqlite3.Error:
         pass
 
-    if not _is_leaderboard_visible(str(interaction.user.id)):
+    if verified_wallets:
+        short = ", ".join(
+            f"{w[:6]}...{w[-4:]}" if len(w) > 14 else w for w in verified_wallets
+        )
+        msg = f"**Verified** — your wallet(s) are linked: {short}"
+        if not _is_leaderboard_visible(discord_id):
+            msg += "\n\n" + _reminder_text()
+        return await interaction.followup.send(msg, ephemeral=True)
+
+    if not rows:
+        message = "**No verification started** — use `/verifywallet` to begin."
+        if not _is_leaderboard_visible(discord_id):
+            message += "\n\n" + _reminder_text()
+        return await interaction.followup.send(message, ephemeral=True)
+
+    has_recent_rejection = bool(rejections)
+    rejection_reason_text = ""
+    fartboy_progress_text = ""
+
+    if has_recent_rejection:
+        reason, rej_wallet, _created = rejections[0]
+        reason_map = {
+            "strict_below_1pct": "your donation from that wallet has not yet reached 1% of your FARTBOY snapshot holding",
+            "strict_no_snapshot_balance": "the sending wallet was not found in the FARTBOY snapshot or has zero balance",
+        }
+        rejection_reason_text = reason_map.get(reason, reason)
+
+        if rej_wallet:
+            try:
+                with _connect_db(SNAPSHOT_DB) as conn:
+                    snap = conn.execute(
+                        f"""
+                        SELECT amount_fartboy, donated_fartboy
+                        FROM {SNAPSHOT_TABLE}
+                        WHERE wallet_address = ?
+                        """,
+                        (rej_wallet,),
+                    ).fetchone()
+                    if snap:
+                        holding = float(snap[0] or 0)
+                        donated = float(snap[1] or 0)
+                        if holding > 0:
+                            pct = (donated / holding) * 100.0
+                            needed = holding * 0.01
+                            fartboy_progress_text = (
+                                f"Progress: {donated:,.2f} / {needed:,.2f} FARTBOY "
+                                f"({pct:.2f}% of 1% requirement)"
+                            )
+            except sqlite3.Error:
+                pass
+
+    war_chest = os.getenv("WARCHEST_ADDRESS", "")
+
+    if pending:
+        otp_value, tick_size, assigned_at = pending
+        remaining = _format_remaining(assigned_at)
+
+        if has_recent_rejection:
+            parts = [
+                f"**Verification attempt received — not completed**",
+                f"Reason: {rejection_reason_text}.",
+            ]
+            if fartboy_progress_text:
+                parts.append(fartboy_progress_text)
+            parts.append(
+                f"\nYour OTP is still active (expires in {remaining}). "
+                f"Donate more FARTBOY to the war chest from the same wallet, "
+                f"then re-send the same OTP amount to verify."
+            )
+            parts.append(f"OTP amount: `{otp_value}`")
+            parts.append(f"War chest: `{war_chest}`")
+        else:
+            parts = [
+                f"**Verification pending** — send the OTP amount to the war chest.",
+                f"OTP amount: `{otp_value}`",
+                f"War chest: `{war_chest}`",
+                f"Expires in {remaining}.",
+            ]
+        await interaction.followup.send("\n".join(parts), ephemeral=True)
+    elif has_recent_rejection:
+        parts = [
+            f"**Verification attempt received — not completed**",
+            f"Reason: {rejection_reason_text}.",
+        ]
+        if fartboy_progress_text:
+            parts.append(fartboy_progress_text)
+        parts.append(
+            "\nYour previous OTP has expired. Use `/verifywallet` to get a new one "
+            "after donating enough to meet the 1% requirement."
+        )
+        await interaction.followup.send("\n".join(parts), ephemeral=True)
+    else:
+        await interaction.followup.send(
+            "**No active OTP** — your previous OTP(s) have expired or been used. "
+            "Use `/verifywallet` to start again.",
+            ephemeral=True,
+        )
+
+    status_labels = {
+        "assigned": "awaiting send",
+        "used": "verified",
+        "expired": "expired",
+        "used_no_match": "sent (no OTP match)",
+    }
+    history_lines = []
+    for otp_value, tick_size, status, assigned_at, used_at, tx_signature in rows[:10]:
+        label = status_labels.get(status, status or "unknown")
+        ts = _discord_time_from_sqlite(used_at or assigned_at)
+        sig_part = f" | tx {tx_signature[:12]}…" if tx_signature else ""
+        history_lines.append(f"- `{otp_value}` | {label} | {ts}{sig_part}")
+
+    if history_lines:
+        await interaction.followup.send(
+            "**Verification history:**\n" + "\n".join(history_lines),
+            ephemeral=True,
+        )
+
+    if not _is_leaderboard_visible(discord_id):
         await interaction.followup.send(_reminder_text(), ephemeral=True)
 
 
@@ -2832,24 +2754,6 @@ async def leaderboard_full(interaction: discord.Interaction):
         ephemeral=True,
         view=view,
     )
-
-
-@app_commands.command(
-    name="dm",
-    description="Send the welcome info and buttons in a DM.",
-)
-async def dm_welcome(interaction: discord.Interaction):
-    success = await _send_full_welcome_dm(interaction.user)
-    if success:
-        await interaction.response.send_message(
-            "Check your DMs for the welcome info and buttons.",
-            ephemeral=True,
-        )
-    else:
-        await interaction.response.send_message(
-            "I couldn't DM you. Please enable DMs for this server and try again.",
-            ephemeral=True,
-        )
 
 
 @bot.command(name="setdonationleaderboard")
@@ -3021,7 +2925,7 @@ _COMMAND_HELP: Dict[str, Dict[str, str]] = {
     "synccommands": {
         "summary": "Sync slash commands.",
         "usage": "`!synccommands`",
-        "details": "Useful after enabling DM commands or adding new ones.",
+        "details": "Useful after adding or changing slash commands.",
     },
     "listcommands": {
         "summary": "List registered slash commands.",
@@ -3082,8 +2986,7 @@ _COMMAND_HELP: Dict[str, Dict[str, str]] = {
             "  `!settier 50 \U0001f949 Bronze Donor`\n"
             "  `!settier 100 \U0001f948 Silver Donor`\n"
             "  `!settier 500 \U0001f451 Gold Donor`\n"
-            "Only the highest qualifying tier's emoji and role are applied.\n"
-            "Top 5 donors automatically get the highest tier."
+            "Only the highest qualifying tier's emoji and role are applied."
         ),
     },
     "removetier": {
@@ -3095,8 +2998,7 @@ _COMMAND_HELP: Dict[str, Dict[str, str]] = {
         "summary": "Show all active donation tiers and the base role.",
         "usage": "`!tiers`",
         "details": (
-            "Displays the base role, all tier thresholds with their emoji and role name, "
-            "and notes that top 5 donors receive the highest tier automatically."
+            "Displays the base role and all tier thresholds with their emoji and role name."
         ),
     },
     "syncdonorroles": {
@@ -3540,28 +3442,13 @@ async def removeexchangewallets(ctx: commands.Context, *wallets: str):
 @bot.command(name="synccommands")
 async def synccommands(ctx: commands.Context):
     try:
-        if ENABLE_DM_COMMANDS:
-            if GUILD_ID:
-                guild = discord.Object(id=int(GUILD_ID))
-                bot.tree.clear_commands(guild=guild)
-                await bot.tree.sync(guild=guild)
-            bot.tree.clear_commands(guild=None)
-            bot.tree.add_command(set_leaderboard_visibility)
-            bot.tree.add_command(my_transactions)
-            bot.tree.add_command(my_wallets)
-            bot.tree.add_command(verify_wallet_otp)
-            bot.tree.add_command(verify_status)
-            bot.tree.add_command(leaderboard_full)
-            bot.tree.add_command(dm_welcome)
-            await bot.tree.sync()
-            await ctx.send("Synced global slash commands (DMs enabled).")
+        if GUILD_ID:
+            guild = discord.Object(id=int(GUILD_ID))
+            await bot.tree.sync(guild=guild)
+            await ctx.send("Synced guild slash commands.")
         else:
-            if GUILD_ID:
-                guild = discord.Object(id=int(GUILD_ID))
-                await bot.tree.sync(guild=guild)
-                await ctx.send("Synced guild slash commands.")
-            else:
-                await ctx.send("DISCORD_GUILD_ID is not set; skipping guild sync.")
+            await bot.tree.sync()
+            await ctx.send("Synced global slash commands.")
     except discord.DiscordException as exc:
         log.exception("Failed to sync commands: %s", exc)
         await ctx.send("Failed to sync slash commands. Check logs.")
@@ -3791,7 +3678,7 @@ async def tiers_cmd(ctx: commands.Context):
             lines.append(
                 f"#{t['id']}: **${t['min_usd']:,.2f}** — {t['emoji']} **{t['role_name']}**"
             )
-        lines.append("\nTop 5 donors automatically receive the highest tier role and emoji.")
+        lines.append("\nTier assignment is based on total donated USD meeting the tier minimum.")
 
     await ctx.send("\n".join(lines))
 
@@ -3806,8 +3693,16 @@ async def syncdonorroles(ctx: commands.Context):
         return await ctx.send("Could not find the configured guild.")
     await ctx.send("Starting donor role sync...")
     try:
-        await sync_donor_roles(guild)
-        await ctx.send("Donor role sync complete.")
+        counts = await sync_donor_roles(guild)
+        parts = [
+            f"Donor role sync complete.",
+            f"Updated: {counts['updated']}",
+            f"Skipped (1% not met): {counts['skipped_base']}",
+            f"Skipped (no tier match): {counts['skipped_tier']}",
+            f"Failed (permission): {counts['failed_permission']}",
+            f"Nickname skipped: {counts['skipped_nick']}",
+        ]
+        await ctx.send("\n".join(parts))
     except Exception as exc:
         log.exception("Manual donor role sync failed: %s", exc)
         await ctx.send(f"Sync failed: {exc}")

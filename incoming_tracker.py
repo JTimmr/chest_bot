@@ -318,7 +318,13 @@ async def track_incoming_multi(
             new_checkpoint_map[address] = new_checkpoint or checkpoint_map.get(address)
             signatures_to_process.extend(collected)
 
-        for signature in set(signatures_to_process):
+        seen_sigs: set = set()
+        unique_sigs: list = []
+        for sig in reversed(signatures_to_process):
+            if sig not in seen_sigs:
+                seen_sigs.add(sig)
+                unique_sigs.append(sig)
+        for signature in unique_sigs:
             tx = await client.get_transaction(signature)
             if not tx:
                 continue
@@ -907,13 +913,14 @@ class IncomingTracker:
             page_limit=self.page_limit,
             request_delay=self.delay,
         )
-        if new_checkpoint_map and new_checkpoint_map != checkpoint_map:
-            _save_checkpoint_map(self.checkpoint_file, new_checkpoint_map)
-            checkpoint_map = new_checkpoint_map
         if not checkpoint_map and not rows:
+            if new_checkpoint_map:
+                _save_checkpoint_map(self.checkpoint_file, new_checkpoint_map)
             print("Checkpoint initialized; no historical transactions processed.")
             return 0, [], []
         if not rows:
+            if new_checkpoint_map and new_checkpoint_map != checkpoint_map:
+                _save_checkpoint_map(self.checkpoint_file, new_checkpoint_map)
             print("No new incoming transactions.")
             return 0, [], []
 
@@ -937,8 +944,13 @@ class IncomingTracker:
 
             computed = await _compute_values_for_rows(rows, self.fartboy_mint, self._last_known_prices)
             if not computed:
-                print("Price lookup failed; skipping donation updates this cycle.")
-                return len(rows), [], []
+                computed = []
+                for row in rows:
+                    if row.get("token") == "FARTBOY":
+                        computed.append((row, 0.0, float(row.get("amount_ui", 0))))
+                    else:
+                        computed.append((row, 0.0, 0.0))
+                print("Price lookup failed; inserting with fallback values (usdc=0).")
 
             sender_wallets: List[str] = []
             verified_discord_ids: List[str] = []
@@ -973,74 +985,76 @@ class IncomingTracker:
                         value_fartboy,
                         value_usdc,
                     )
-                    if row.get("token") == "FARTBOY" and row.get("amount_ui", 0) < 1:
-                        if row.get("sender_wallet") in exchange_wallets:
+
+                if row.get("token") == "FARTBOY" and row.get("amount_ui", 0) < 1:
+                    if row.get("sender_wallet") in exchange_wallets:
+                        continue
+                    decimals = int(row.get("decimals", 0))
+                    amount_raw = int(row.get("amount_raw", 0))
+                    verification_order = _get_verification_order(self.state_db)
+                    for tick in (5, 6):
+                        otp_value = _format_otp_if_exact(amount_raw, decimals, tick)
+                        if not otp_value:
                             continue
-                        decimals = int(row.get("decimals", 0))
-                        amount_raw = int(row.get("amount_raw", 0))
-                        # Mirror: holder_leaderboard_bot.py _process_signature has
-                        # the same peek/strict/rejection logic and must stay in sync.
-                        verification_order = _get_verification_order(self.state_db)
-                        for tick in (5, 6):
-                            otp_value = _format_otp_if_exact(amount_raw, decimals, tick)
-                            if not otp_value:
-                                continue
-                            peek = _peek_assigned_otp(snapshot_conn, otp_value, tick)
-                            if peek is None:
-                                _record_used_otp(
-                                    snapshot_conn,
-                                    otp_value,
-                                    tick,
-                                    row["signature"],
-                                    row["sender_wallet"],
-                                )
-                                continue
-                            discord_id, discord_name = peek
-                            if verification_order == "strict":
-                                rejection = _check_strict_gate(
-                                    snapshot_conn,
-                                    self.snapshot_table,
-                                    row["sender_wallet"],
-                                )
-                                if rejection:
-                                    _insert_verification_rejection(
-                                        snapshot_conn,
-                                        discord_id,
-                                        row["sender_wallet"],
-                                        row["signature"],
-                                        rejection,
-                                    )
-                                    break
-                            matched = _match_assigned_otp(
+                        peek = _peek_assigned_otp(snapshot_conn, otp_value, tick)
+                        if peek is None:
+                            _record_used_otp(
                                 snapshot_conn,
                                 otp_value,
                                 tick,
                                 row["signature"],
                                 row["sender_wallet"],
                             )
-                            if matched:
-                                verified_discord_ids.append(discord_id)
-                                snapshot_conn.execute(
-                                    f"""
-                                    UPDATE {self.snapshot_table}
-                                    SET discord_id = ?, discord_name = ?, on_leaderboard = 0
-                                    WHERE wallet_address = ?
-                                      AND (discord_id IS NULL OR discord_id = ?)
-                                    """,
-                                    (discord_id, discord_name, row["sender_wallet"], discord_id),
-                                )
-                                snapshot_conn.commit()
-                                _recompute_summary_for_discord_id(
+                            continue
+                        discord_id, discord_name = peek
+                        if verification_order == "strict":
+                            rejection = _check_strict_gate(
+                                snapshot_conn,
+                                self.snapshot_table,
+                                row["sender_wallet"],
+                            )
+                            if rejection:
+                                _insert_verification_rejection(
                                     snapshot_conn,
                                     discord_id,
-                                    snapshot_table=self.snapshot_table,
-                                    tx_db_path=self.tx_db,
-                                    tx_table=self.tx_table,
+                                    row["sender_wallet"],
+                                    row["signature"],
+                                    rejection,
                                 )
-                            break
+                                break
+                        matched = _match_assigned_otp(
+                            snapshot_conn,
+                            otp_value,
+                            tick,
+                            row["signature"],
+                            row["sender_wallet"],
+                        )
+                        if matched:
+                            verified_discord_ids.append(discord_id)
+                            snapshot_conn.execute(
+                                f"""
+                                UPDATE {self.snapshot_table}
+                                SET discord_id = ?, discord_name = ?, on_leaderboard = 0
+                                WHERE wallet_address = ?
+                                  AND (discord_id IS NULL OR discord_id = ?)
+                                """,
+                                (discord_id, discord_name, row["sender_wallet"], discord_id),
+                            )
+                            snapshot_conn.commit()
+                            _recompute_summary_for_discord_id(
+                                snapshot_conn,
+                                discord_id,
+                                snapshot_table=self.snapshot_table,
+                                tx_db_path=self.tx_db,
+                                tx_table=self.tx_table,
+                            )
+                        break
         finally:
             tx_conn.close()
             snapshot_conn.close()
+
+        if new_checkpoint_map and new_checkpoint_map != checkpoint_map:
+            _save_checkpoint_map(self.checkpoint_file, new_checkpoint_map)
         return len(rows), sender_wallets, verified_discord_ids
 
     async def init_checkpoint(self) -> int:

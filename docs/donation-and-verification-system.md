@@ -77,7 +77,14 @@ Then she runs /verifywallet, sends e.g. 0.00123 FARTBOY, and checks /verifystatu
 
 ### `/verifystatus`
 
-Triggers an on-demand tracker pass (when configured), shows OTP history, and any recent **rejection** reasons if they sent OTP too early.
+Triggers an on-demand tracker pass (when configured) then shows a single clear status message:
+
+- **Verified** — wallet is linked; shows linked wallet address(es).
+- **Pending** — active OTP, no rejection; shows OTP amount and war chest address.
+- **Attempt received, not completed** — active or expired OTP with a strict-mode rejection; explains the reason in plain language, shows FARTBOY 1% progress (donated vs needed), and advises donating more before retrying.
+- **No verification started** — no OTP history at all.
+
+A compact verification history follows with friendly labels (`awaiting send`, `verified`, `expired`).
 
 ### `/mywallets`, `/mytransactions`, `/leaderboard`, `/leaderboardvisibility`
 
@@ -309,7 +316,7 @@ Fix: Donate until 1% is met, send the **same** OTP amount again (or get a new OT
 
 ---
 
-## What the bot does not do
+## Notes
 
-- It does **not** send “you are verified” DMs. Members use **ephemeral** `/verifystatus`.
-- It does **not** require **Manage Server** on Discord for `!` commands — channel access is enough.
+- Verification outcomes are shown via **ephemeral** `/verifystatus` in the server (no DMs).
+- `!` commands do **not** require **Manage Server** on Discord — access to the admin command channel is enough.
