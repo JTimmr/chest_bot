@@ -300,11 +300,15 @@ async def _discover_via_enhanced_api(
     target_wallet: str,
     allowed_spl_mints: Set[str],
     limit: int,
+    not_before: Optional[int] = None,
 ) -> List[str]:
     """Use Helius Enhanced Transactions API to find incoming transfer signatures.
 
     Returns signatures for token/SOL transfers TO target_wallet that the
     standard getSignaturesForAddress may have missed.
+
+    If not_before is set (unix timestamp), transactions older than that are
+    excluded — prevents backfilling history before !golive.
     """
     try:
         enhanced_txs = await client.get_enhanced_transactions(target_wallet, limit=limit)
@@ -318,6 +322,10 @@ async def _discover_via_enhanced_api(
         sig = etx.get("signature")
         if not sig:
             continue
+        if not_before is not None:
+            tx_ts = etx.get("timestamp")
+            if isinstance(tx_ts, (int, float)) and tx_ts < not_before:
+                continue
         tx_type = etx.get("type", "")
         if tx_type not in ("TRANSFER", "SWAP", "UNKNOWN"):
             continue
@@ -353,6 +361,8 @@ async def track_incoming_multi(
     results: List[Dict] = []
     allowed_spl_mints = {fartboy_mint, USDC_MINT, USDT_MINT}
     new_checkpoint_map: Dict[str, Optional[str]] = {}
+    if CHECKPOINT_TS_KEY in checkpoint_map:
+        new_checkpoint_map[CHECKPOINT_TS_KEY] = checkpoint_map[CHECKPOINT_TS_KEY]
     signatures_to_process: List[str] = []
 
     async def collect_new_signatures(
@@ -397,9 +407,12 @@ async def track_incoming_multi(
 
         # Fallback: use Enhanced Transactions API to catch signatures that
         # getSignaturesForAddress missed due to Helius indexing gaps.
-        if ENHANCED_TX_LIMIT > 0:
+        # Only include transactions from after !golive to prevent backfilling history.
+        golive_ts = _get_golive_ts(checkpoint_map)
+        if ENHANCED_TX_LIMIT > 0 and golive_ts is not None:
             enhanced_sigs = await _discover_via_enhanced_api(
-                client, target_wallet, allowed_spl_mints, ENHANCED_TX_LIMIT
+                client, target_wallet, allowed_spl_mints, ENHANCED_TX_LIMIT,
+                not_before=golive_ts,
             )
             signatures_to_process.extend(enhanced_sigs)
 
@@ -1069,6 +1082,9 @@ def _calculate_values(
     return value_usdc, value_fartboy
 
 
+CHECKPOINT_TS_KEY = "_golive_ts"
+
+
 def _load_checkpoint_map(path: str) -> Dict[str, Optional[str]]:
     if not os.path.exists(path):
         return {}
@@ -1080,6 +1096,16 @@ def _load_checkpoint_map(path: str) -> Dict[str, Optional[str]]:
         return {}
     except (OSError, json.JSONDecodeError):
         return {}
+
+
+def _get_golive_ts(checkpoint_map: Dict[str, Optional[str]]) -> Optional[int]:
+    val = checkpoint_map.get(CHECKPOINT_TS_KEY)
+    if val is None:
+        return None
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return None
 
 
 def _save_checkpoint_map(path: str, payload: Dict[str, Optional[str]]) -> None:
@@ -1326,6 +1352,7 @@ class IncomingTracker:
                 sigs = await client.get_signatures_for_address(address, limit=1)
                 latest = sigs[0].get("signature") if sigs else None
                 checkpoint_map[address] = latest or None
+        checkpoint_map[CHECKPOINT_TS_KEY] = str(int(time.time()))
         _save_checkpoint_map(self.checkpoint_file, checkpoint_map)
         return len(addresses)
 
