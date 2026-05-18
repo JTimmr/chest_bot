@@ -830,11 +830,6 @@ async def sync_donor_roles(guild: discord.Guild) -> Dict[str, int]:
 
         has_base = base_role in member.roles
         has_tier = target_tier_role in member.roles
-        counts["debug"].append(
-            f"User {discord_id}: base={base_role.name}(id:{base_role.id}) "
-            f"has_base={has_base}, tier={target_tier_role.name}(id:{target_tier_role.id}) "
-            f"has_tier={has_tier}, member_roles={[(r.name, r.id) for r in member.roles if r.name != '@everyone']}"
-        )
         if not has_base:
             roles_to_add.add(base_role)
         if not has_tier:
@@ -843,6 +838,19 @@ async def sync_donor_roles(guild: discord.Guild) -> Dict[str, int]:
         for tr in tier_roles:
             if tr != target_tier_role and tr in member.roles:
                 roles_to_remove.add(tr)
+
+        member_name = str(member)
+        donated_str = f"${donated_usd:,.2f}"
+        tier_name = target_tier_role.name
+        status_parts = [f"**{member_name}** ({discord_id}): {donated_str} → {tier_name}"]
+        if not roles_to_add and not roles_to_remove:
+            status_parts.append("roles OK")
+        else:
+            if roles_to_add:
+                status_parts.append(f"+{', '.join(r.name for r in roles_to_add)}")
+            if roles_to_remove:
+                status_parts.append(f"-{', '.join(r.name for r in roles_to_remove)}")
+        counts["debug"].append(" | ".join(status_parts))
 
         try:
             if roles_to_remove:
@@ -2984,6 +2992,14 @@ _COMMAND_HELP: Dict[str, Dict[str, str]] = {
         "usage": "`!removeverification WALLET_ADDRESS`",
         "details": "Dangerous: unlinks that wallet and clears any donation links.",
     },
+    "setvisibility": {
+        "summary": "Show or hide a user on the public leaderboard.",
+        "usage": "`!setvisibility @user visible|hidden`",
+        "details": (
+            "Sets leaderboard visibility for the given user. 'visible' shows their name; "
+            "'hidden' makes them anonymous. The user must have a verified wallet."
+        ),
+    },
     "setuserthreshold": {
         "summary": "Override perk eligibility threshold for a user.",
         "usage": "`!setuserthreshold @user true|false|reset`",
@@ -3154,6 +3170,7 @@ def _build_help_embed(command_name: Optional[str]) -> discord.Embed:
             "setexchangewallets",
             "removeexchangewallets",
             "setuserthreshold",
+            "setvisibility",
             "setverificationorder",
         ],
         "Transactions": [
@@ -3408,6 +3425,26 @@ async def setuserthreshold(ctx: commands.Context, member: discord.Member | None 
     except sqlite3.Error as exc:
         log.error("Failed to set user threshold: %s", exc)
         await ctx.send("Failed to update threshold. Check logs.")
+
+
+@bot.command(name="setvisibility")
+@commands.has_permissions(manage_guild=True)
+async def setvisibility(ctx: commands.Context, member: discord.Member | None = None, value: str = ""):
+    """Admin command to show or hide a user on the public leaderboard."""
+    if not member or value not in ("visible", "hidden"):
+        return await ctx.send("Usage: `!setvisibility @user visible|hidden`")
+    discord_id = str(member.id)
+    discord_name = str(member)
+    visible = 1 if value == "visible" else 0
+    ok = _update_visibility_by_discord(discord_id, discord_name, visible)
+    if not ok:
+        return await ctx.send(
+            f"No verified wallet found for {member.mention}. They need to verify first."
+        )
+    _set_summary_visibility(discord_id, visible)
+    await bot._refresh_leaderboards()
+    label = "visible" if visible else "hidden"
+    await ctx.send(f"Leaderboard visibility for {member.mention} set to **{label}**.")
 
 
 @bot.command(name="setverificationorder")
@@ -3862,20 +3899,26 @@ async def syncdonorroles(ctx: commands.Context):
         )
         log.info("Recomputed %s verified user summaries before role sync.", n)
         counts = await sync_donor_roles(guild)
-        parts = [
-            f"Donor role sync complete.",
-            f"Processed: {counts['processed']}",
-            f"Updated: {counts['updated']}",
-            f"Skipped (1% not met): {counts['skipped_base']}",
-            f"Skipped (no tier match): {counts['skipped_tier']}",
-            f"Failed (permission): {counts['failed_permission']}",
-            f"Nickname skipped: {counts['skipped_nick']}",
-        ]
+        lines = ["**Donor role sync complete.**", ""]
         if counts["debug"]:
-            parts.append("--- Debug ---")
             for d in counts["debug"]:
-                parts.append(d)
-        await ctx.send("\n".join(parts))
+                lines.append(d)
+            lines.append("")
+        summary_parts = [f"{counts['processed']} processed"]
+        if counts["updated"]:
+            summary_parts.append(f"{counts['updated']} updated")
+        if counts["skipped_base"]:
+            summary_parts.append(f"{counts['skipped_base']} skipped (1% not met)")
+        if counts["skipped_tier"]:
+            summary_parts.append(f"{counts['skipped_tier']} skipped (no tier match)")
+        if counts["failed_permission"]:
+            summary_parts.append(f"{counts['failed_permission']} failed (permission)")
+        if counts["skipped_nick"]:
+            summary_parts.append(f"{counts['skipped_nick']} nickname skipped")
+        lines.append(" | ".join(summary_parts))
+        msg = "\n".join(lines)
+        for chunk in [msg[i:i+1900] for i in range(0, len(msg), 1900)]:
+            await ctx.send(chunk)
         await bot._refresh_leaderboards()
     except Exception as exc:
         log.exception("Manual donor role sync failed: %s", exc)
@@ -4026,6 +4069,7 @@ async def donortop(ctx: commands.Context, count: str = "10"):
 @settier.error
 @removetier.error
 @syncdonorroles.error
+@setvisibility.error
 async def tier_cmd_error(ctx: commands.Context, error: Exception):
     if isinstance(error, commands.MissingPermissions):
         await ctx.send("You need **Manage Server** to run this.")

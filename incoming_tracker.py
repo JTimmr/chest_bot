@@ -267,6 +267,9 @@ def _to_ts_seconds(value: Optional[object]) -> Optional[int]:
     return None
 
 
+CHECKPOINT_LOOKBACK = int(os.getenv("CHECKPOINT_LOOKBACK", "5"))
+
+
 async def track_incoming_multi(
     target_wallet: str,
     api_key: str,
@@ -289,6 +292,8 @@ async def track_incoming_multi(
         new_checkpoint: Optional[str] = None
         collected: List[str] = []
         page_idx = 0
+        hit_checkpoint = False
+        lookback_remaining = CHECKPOINT_LOOKBACK
         while True:
             if max_pages is not None and page_idx >= max_pages:
                 break
@@ -306,8 +311,18 @@ async def track_incoming_multi(
                 if not signature:
                     continue
                 if checkpoint_sig and signature == checkpoint_sig:
-                    return collected, new_checkpoint
-                collected.append(signature)
+                    hit_checkpoint = True
+                    lookback_remaining -= 1
+                    continue
+                if hit_checkpoint:
+                    lookback_remaining -= 1
+                    collected.append(signature)
+                    if lookback_remaining <= 0:
+                        return collected, new_checkpoint
+                else:
+                    collected.append(signature)
+            if hit_checkpoint:
+                return collected, new_checkpoint
             before_sig = sigs[-1].get("signature")
             if not before_sig:
                 break
