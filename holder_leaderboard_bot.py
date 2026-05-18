@@ -500,12 +500,47 @@ def _remove_tier(tier_id: int) -> bool:
         return False
 
 
+def _lookup_guild_role_by_name(guild: discord.Guild, name: str) -> Optional[discord.Role]:
+    """Find a guild role by name, including names that literally start with '@'."""
+    role = discord.utils.get(guild.roles, name=name)
+    if role:
+        return role
+
+    if name.startswith("@"):
+        possible_names = [name, name[1:]]
+    else:
+        possible_names = [name, f"@{name}"]
+
+    for pname in possible_names:
+        role = discord.utils.get(guild.roles, name=pname)
+        if role:
+            return role
+
+    lower_names = {p.lower() for p in possible_names}
+    for r in guild.roles:
+        if r.name.lower() in lower_names:
+            return r
+    return None
+
+
+def _canonical_role_name(guild: discord.Guild, stored: str) -> str:
+    """Resolve a stored role reference to the guild's canonical role name."""
+    mention_match = re.match(r"<@&(\d+)>$", stored.strip())
+    if mention_match:
+        role = guild.get_role(int(mention_match.group(1)))
+        return role.name if role else stored
+
+    role = _lookup_guild_role_by_name(guild, stored)
+    return role.name if role else stored
+
+
 def _resolve_role_input(guild: discord.Guild, raw: str) -> Optional[str]:
     """Resolve a role input to a role name.
 
     Handles: <@&ID> mentions, @Name plain text, or just Name.
-    Returns the role name if found, or the raw input if no guild match
-    is needed (plain name without @).
+    For @-prefixed input, tries the literal name first (e.g. '@Tiny Tooter'),
+    then falls back to the name without '@'. Plain names without '@' are
+    returned unchanged.
     """
     mention_match = re.match(r"<@&(\d+)>$", raw)
     if mention_match:
@@ -513,15 +548,8 @@ def _resolve_role_input(guild: discord.Guild, raw: str) -> Optional[str]:
         return role.name if role else None
 
     if raw.startswith("@"):
-        name = raw[1:]
-        role = discord.utils.get(guild.roles, name=name)
-        if role:
-            return role.name
-        lower = name.lower()
-        for r in guild.roles:
-            if r.name.lower() == lower:
-                return r.name
-        return None
+        role = _lookup_guild_role_by_name(guild, raw)
+        return role.name if role else None
 
     return raw
 
@@ -663,22 +691,9 @@ async def sync_donor_roles(guild: discord.Guild) -> Dict[str, int]:
     if not tiers or not base_role_name:
         return counts
 
-    # Resolve any stored mention strings to actual role names
-    mention_match = re.match(r"<@&(\d+)>", base_role_name)
-    if mention_match:
-        role_obj = guild.get_role(int(mention_match.group(1)))
-        if role_obj:
-            base_role_name = role_obj.name
+    base_role_name = _canonical_role_name(guild, base_role_name)
     for t in tiers:
-        tmatch = re.match(r"<@&(\d+)>", t["role_name"])
-        if tmatch:
-            role_obj = guild.get_role(int(tmatch.group(1)))
-            if role_obj:
-                t["role_name"] = role_obj.name
-        elif t["role_name"].startswith("@"):
-            role_obj = discord.utils.get(guild.roles, name=t["role_name"][1:])
-            if role_obj:
-                t["role_name"] = role_obj.name
+        t["role_name"] = _canonical_role_name(guild, t["role_name"])
 
     tiers_desc = sorted(tiers, key=lambda t: t["min_usd"], reverse=True)
     all_role_names = {base_role_name} | {t["role_name"] for t in tiers}
@@ -686,7 +701,7 @@ async def sync_donor_roles(guild: discord.Guild) -> Dict[str, int]:
 
     role_map: Dict[str, discord.Role] = {}
     for rn in all_role_names:
-        existing = discord.utils.get(guild.roles, name=rn)
+        existing = _lookup_guild_role_by_name(guild, rn)
         if existing:
             role_map[rn] = existing
         else:
