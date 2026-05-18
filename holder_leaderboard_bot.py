@@ -3552,6 +3552,37 @@ async def synccommands(ctx: commands.Context):
         await ctx.send("Failed to sync slash commands. Check logs.")
 
 
+@bot.command(name="debugroles")
+async def debugroles(ctx: commands.Context):
+    """Dump all guild roles and the bot's stored config for diagnosis."""
+    if not ctx.guild:
+        return await ctx.send("Must be run in a guild.")
+    lines = ["**All guild roles (name → id):**"]
+    for r in sorted(ctx.guild.roles, key=lambda r: r.position, reverse=True):
+        if r.name == "@everyone":
+            continue
+        lines.append(f"`{r.name}` → {r.id}")
+    lines.append("")
+    base_name = _get_donor_config("base_role_name") or "(not set)"
+    base_id = _get_donor_config("base_role_id") or "(not set)"
+    lines.append(f"**Stored base_role_name:** `{base_name}`")
+    lines.append(f"**Stored base_role_id:** `{base_id}`")
+    tiers = _fetch_tiers()
+    if tiers:
+        lines.append("\n**Stored tiers:**")
+        for t in tiers:
+            rid = t.get("role_id") or "(none)"
+            lines.append(f"  #{t['id']}: ${t['min_usd']:,.2f} — {t['emoji']} role_name=`{t['role_name']}` role_id=`{rid}`")
+    else:
+        lines.append("\n**No tiers configured.**")
+    msg = "\n".join(lines)
+    if len(msg) > 1900:
+        for i in range(0, len(msg), 1900):
+            await ctx.send(msg[i:i+1900])
+    else:
+        await ctx.send(msg)
+
+
 @bot.command(name="listcommands")
 async def listcommands(ctx: commands.Context):
     try:
