@@ -500,6 +500,32 @@ def _remove_tier(tier_id: int) -> bool:
         return False
 
 
+def _resolve_role_input(guild: discord.Guild, raw: str) -> Optional[str]:
+    """Resolve a role input to a role name.
+
+    Handles: <@&ID> mentions, @Name plain text, or just Name.
+    Returns the role name if found, or the raw input if no guild match
+    is needed (plain name without @).
+    """
+    mention_match = re.match(r"<@&(\d+)>$", raw)
+    if mention_match:
+        role = guild.get_role(int(mention_match.group(1)))
+        return role.name if role else None
+
+    if raw.startswith("@"):
+        name = raw[1:]
+        role = discord.utils.get(guild.roles, name=name)
+        if role:
+            return role.name
+        lower = name.lower()
+        for r in guild.roles:
+            if r.name.lower() == lower:
+                return r.name
+        return None
+
+    return raw
+
+
 def _fetch_tiers() -> List[Dict]:
     try:
         with _connect_db(STATE_DB) as conn:
@@ -646,6 +672,10 @@ async def sync_donor_roles(guild: discord.Guild) -> Dict[str, int]:
         tmatch = re.match(r"<@&(\d+)>", t["role_name"])
         if tmatch:
             role_obj = guild.get_role(int(tmatch.group(1)))
+            if role_obj:
+                t["role_name"] = role_obj.name
+        elif t["role_name"].startswith("@"):
+            role_obj = discord.utils.get(guild.roles, name=t["role_name"][1:])
             if role_obj:
                 t["role_name"] = role_obj.name
 
@@ -3638,14 +3668,9 @@ async def setbaserole(ctx: commands.Context, *, role_name: str = ""):
     """Set the base contributor role given to all qualifying donors."""
     if not role_name.strip():
         return await ctx.send("Usage: `!setbaserole <role_name>`\nExample: `!setbaserole Contributor`")
-    resolved = role_name.strip()
-    mention_match = re.match(r"<@&(\d+)>", resolved)
-    if mention_match:
-        role = ctx.guild.get_role(int(mention_match.group(1)))
-        if role:
-            resolved = role.name
-        else:
-            return await ctx.send("Could not find that role in this server.")
+    resolved = _resolve_role_input(ctx.guild, role_name.strip())
+    if resolved is None:
+        return await ctx.send("Could not find that role in this server.")
     success = _set_donor_config("base_role_name", resolved)
     if success:
         await ctx.send(f"Base donor role set to **{resolved}**.")
@@ -3667,14 +3692,9 @@ async def settier(ctx: commands.Context, min_usd: str = "", emoji: str = "", *, 
             return await ctx.send("Minimum USD must be zero or positive.")
     except ValueError:
         return await ctx.send("Invalid amount. Use a number like `100` or `250.00`.")
-    resolved = role_name.strip()
-    mention_match = re.match(r"<@&(\d+)>", resolved)
-    if mention_match:
-        role = ctx.guild.get_role(int(mention_match.group(1)))
-        if role:
-            resolved = role.name
-        else:
-            return await ctx.send("Could not find that role in this server.")
+    resolved = _resolve_role_input(ctx.guild, role_name.strip())
+    if resolved is None:
+        return await ctx.send("Could not find that role in this server.")
     tier_id = _add_tier(amount, emoji.strip(), resolved)
     if tier_id is None:
         return await ctx.send("Failed to add tier. Check logs.")
