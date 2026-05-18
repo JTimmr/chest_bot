@@ -1578,9 +1578,8 @@ async def _process_signature(signature: str, discord_id: str | None = None) -> T
         _ensure_otp_registry(snapshot_conn)
         _expire_otps(snapshot_conn)
         for row, value_usdc, value_fartboy in computed:
-            # When @user is passed to !addtransaction, always set tx.discord_id (including
-            # exchange senders). This does not verify the wallet on the snapshot; OTP still
-            # skips exchange wallets so snapshot discord_id is never set from them here.
+            if row.get("token") != "FARTBOY" and value_usdc < 0.01:
+                continue
             row_discord_id = discord_id if discord_id else None
             cur = tx_conn.cursor()
             cur.execute(
@@ -2650,6 +2649,19 @@ async def my_wallets(interaction: discord.Interaction):
     )
 
 
+async def _log_otp(user: discord.User | discord.Member, otp_value: str) -> None:
+    """Send OTP assignment to the admin log channel, if configured."""
+    channel_id = _get_donor_config("otp_log_channel_id")
+    if not channel_id:
+        return
+    try:
+        channel = bot.get_channel(int(channel_id))
+        if channel and isinstance(channel, discord.TextChannel):
+            await channel.send(f"OTP assigned: **{user}** → `{otp_value}`")
+    except Exception as exc:
+        log.warning("Failed to send OTP log: %s", exc)
+
+
 @app_commands.command(
     name="verifywallet",
     description="Generate a unique small-amount OTP for wallet verification.",
@@ -2663,6 +2675,7 @@ async def verify_wallet_otp(interaction: discord.Interaction):
         )
     otp_value, tick = otp
     war_chest = os.getenv("WARCHEST_ADDRESS", "")
+    await _log_otp(interaction.user, otp_value)
     show_reminder = not _is_leaderboard_visible(str(interaction.user.id))
     assigned_at = None
     try:
@@ -2686,13 +2699,11 @@ async def verify_wallet_otp(interaction: discord.Interaction):
         "To verify your wallet, send the exact amount of FARTBOY given below to the war chest. "
         "This amount acts as a One-Time-Password (OTP), and will expire after 60 minutes. "
         "You can always run /verifywallet again after that to get a new OTP.\n\n"
-        "Your verification should be done within 3 minutes after the OTP amount of FARTBOY has been sent. "
-        "You can check the status and trigger immediate verification by running /verifystatus.\n\n"
-        "**Important:** Your wallet must be on the holder snapshot with a positive balance, and you "
-        "must have donated at least 1% of that balance to the war chest **before** sending the OTP. "
-        "If you send the OTP too early, verification will be rejected and you can try again after "
-        "donating more. Wallets not on the snapshot (for example exchange hot wallets) cannot use "
-        "automatic OTP — ask an admin for manual verification instead."
+        "**Important:** You must donate at least **1% of your FARTBOY snapshot balance** to the "
+        "war chest **before** sending the OTP. If you send the OTP too early, verification will "
+        "be rejected — you can try again after donating more.\n\n"
+        "After sending, click **Verify status** to trigger verification.\n"
+        "If something doesn't work or you need help, ask the mods."
     )
     if show_reminder:
         instructions += (
@@ -2951,13 +2962,17 @@ async def setdonationleaderboard(
     _save_state("recent", channel.id, recent_msg.id, 20)
     war_chest = os.getenv("WARCHEST_ADDRESS", "")
     await channel.send(
-        "Send FARTBOY, SOL USDT or USDC to the following SOLANA address to donate:"
+        "Send FARTBOY, SOL, USDT or USDC to the following SOLANA address to donate:"
     )
     await channel.send(war_chest)
     info = (
-        "Wallets can be verified at any time, even after donations. "
-        "Donations sent from exchanges are not eligible for perks or leaderboard visibility. "
-        "Choosing to appear on the leaderboard is optional and does not affect perks."
+        "**How to verify your wallet:**\n"
+        "1. Donate at least **1% of your FARTBOY snapshot balance** to the war chest.\n"
+        "2. Click **Verify wallet** to get a unique OTP amount.\n"
+        "3. Send that exact OTP amount of FARTBOY to the war chest.\n"
+        "4. Click **Verify status** to confirm — done!\n\n"
+        "Choosing to appear on the leaderboard is optional and does not affect perks.\n"
+        "If something doesn't work or you need help, ask the mods."
     )
     await channel.send(info, view=VerificationButtonsView())
 
@@ -2987,6 +3002,17 @@ async def setpagelimit(ctx: commands.Context, limit: int = 0):
         return await ctx.send("Tracker is not configured (missing env vars).")
     bot._tracker.page_limit = limit
     await ctx.send(f"Tracker page limit set to {limit} signatures per address.")
+
+
+@bot.command(name="setlogchannel")
+async def setlogchannel(ctx: commands.Context, channel: discord.TextChannel | None = None):
+    if channel is None:
+        current = _get_donor_config("otp_log_channel_id")
+        if current:
+            return await ctx.send(f"OTP log channel: <#{current}>")
+        return await ctx.send("No OTP log channel set. Usage: `!setlogchannel #channel`")
+    _set_donor_config("otp_log_channel_id", str(channel.id))
+    await ctx.send(f"OTP log channel set to {channel.mention}.")
 
 
 @bot.command(name="golive")
@@ -3207,6 +3233,31 @@ _COMMAND_HELP: Dict[str, Dict[str, str]] = {
             "and verified_users.total_donated_usd have diverged. Refreshes leaderboard embeds."
         ),
     },
+    "donorstats": {
+        "summary": "Show donation statistics.",
+        "usage": "`!donorstats [min_usd]`",
+        "details": "Shows totals, averages, and counts. Optional min_usd filters donors above that amount.",
+    },
+    "walletsummary": {
+        "summary": "Show wallet verification status and holdings breakdown.",
+        "usage": "`!walletsummary`",
+        "details": "Displays counts of verified vs unverified wallets and aggregate holdings.",
+    },
+    "donortop": {
+        "summary": "Show top donors by USD donated.",
+        "usage": "`!donortop [count]`",
+        "details": "Defaults to top 10. Max 25.",
+    },
+    "debugroles": {
+        "summary": "Dump guild roles and stored tier config for diagnosis.",
+        "usage": "`!debugroles`",
+        "details": "Shows all server roles and the bot's stored base role / tier IDs.",
+    },
+    "setlogchannel": {
+        "summary": "Set the admin OTP log channel.",
+        "usage": "`!setlogchannel #channel`",
+        "details": "Every OTP assignment will be logged here with username and amount. No args shows current.",
+    },
 }
 
 
@@ -3284,14 +3335,20 @@ def _build_help_embed(command_name: Optional[str]) -> discord.Embed:
             "recomputesummaries",
             "syncdonorroles",
         ],
+        "Stats": [
+            "donorstats",
+            "walletsummary",
+            "donortop",
+        ],
         "Admin utilities": [
             "settrackerinterval",
             "setpagelimit",
             "setdonationleadersize",
+            "setlogchannel",
+            "debugroles",
             "synccommands",
             "listcommands",
             "help",
-            "donationbothelp",
         ],
     }
     emb = discord.Embed(

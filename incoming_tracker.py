@@ -1235,6 +1235,9 @@ class IncomingTracker:
             sender_wallets: List[str] = []
             verified_discord_ids: List[str] = []
             for row, value_usdc, value_fartboy in computed:
+                # Ignore non-FARTBOY donations worth less than $0.01.
+                if row.get("token") != "FARTBOY" and value_usdc < 0.01:
+                    continue
                 cur = tx_conn.cursor()
                 cur.execute(
                     f"""
