@@ -30,6 +30,10 @@ SOL_DECIMALS = 9
 OTP_TABLE = os.getenv("OTP_TABLE", "otp_registry")
 OTP_EXPIRY_SECONDS = int(os.getenv("OTP_EXPIRY_SECONDS", "3600"))
 SUMMARY_TABLE = os.getenv("SUMMARY_TABLE", "verified_users")
+SNAPSHOT_DB = os.getenv("SNAPSHOT_DB", "data/fartboy_snapshot.db")
+SNAPSHOT_TABLE = os.getenv("SNAPSHOT_TABLE", "fartboy_holders")
+TX_DB = os.getenv("TX_DB", "data/incoming_transactions.db")
+TX_TABLE = os.getenv("TX_TABLE", "incoming_transactions")
 
 
 class RateLimiter:
@@ -672,6 +676,30 @@ def _match_assigned_otp(
     return row[0], row[1] or ""
 
 
+def _tx_totals_by_sender(
+    tx_conn: sqlite3.Connection,
+    tx_table: str,
+    discord_id: str,
+) -> Dict[str, Tuple[float, float]]:
+    """Map sender_wallet -> (sum value_usdc, sum value_fartboy) for attributed txs."""
+    rows = tx_conn.execute(
+        f"""
+        SELECT sender_wallet,
+               COALESCE(SUM(value_usdc), 0),
+               COALESCE(SUM(value_fartboy), 0)
+        FROM {tx_table}
+        WHERE discord_id = ?
+        GROUP BY sender_wallet
+        """,
+        (discord_id,),
+    ).fetchall()
+    return {
+        str(r[0]): (float(r[1] or 0), float(r[2] or 0))
+        for r in rows
+        if r and r[0]
+    }
+
+
 def _recompute_summary_for_discord_id(
     conn: sqlite3.Connection,
     discord_id: str,
@@ -680,10 +708,15 @@ def _recompute_summary_for_discord_id(
     tx_db_path: Optional[str] = None,
     tx_table: str = "incoming_transactions",
 ) -> None:
-    """Rebuild SUMMARY_TABLE from verified snapshot rows plus tx-only attribution (see holder bot)."""
+    """Rebuild SUMMARY_TABLE from verified snapshot rows plus tx-only attribution.
+
+    Per linked wallet uses max(snapshot donated_usd, attributed tx sum) so summaries
+    cannot stay at $0 when snapshot donated_usd lags behind the tx table. Exchange
+    deposits remain counted via txs whose sender is not a verified wallet.
+    """
     wallets = conn.execute(
         f"""
-        SELECT wallet_address, amount_fartboy, donated_usd, discord_name
+        SELECT wallet_address, amount_fartboy, donated_usd, donated_fartboy, discord_name
         FROM {snapshot_table}
         WHERE discord_id = ?
         """,
@@ -691,11 +724,13 @@ def _recompute_summary_for_discord_id(
     ).fetchall()
 
     verified_wallets = {str(r[0]) for r in wallets if r and r[0]}
+    tx_by_sender: Dict[str, Tuple[float, float]] = {}
     extra_usd = 0.0
     if tx_db_path:
         try:
             with sqlite3.connect(tx_db_path) as tx_conn:
                 _init_transactions_db(tx_conn, tx_table)
+                tx_by_sender = _tx_totals_by_sender(tx_conn, tx_table, discord_id)
                 if verified_wallets:
                     placeholders = ",".join("?" * len(verified_wallets))
                     row = tx_conn.execute(
@@ -718,13 +753,14 @@ def _recompute_summary_for_discord_id(
                     ).fetchone()
                 extra_usd = float(row[0] or 0) if row else 0.0
         except sqlite3.Error:
+            tx_by_sender = {}
             extra_usd = 0.0
 
     if not wallets:
         if extra_usd <= 0:
             return
         total_holdings = 0.0
-        total_donated_snapshot = 0.0
+        total_donated_usd = extra_usd
         name_row = conn.execute(
             f"SELECT discord_name FROM {SUMMARY_TABLE} WHERE discord_id = ?",
             (discord_id,),
@@ -733,11 +769,29 @@ def _recompute_summary_for_discord_id(
         wallet_list = ""
     else:
         total_holdings = sum(float(r[1] or 0) for r in wallets)
-        total_donated_snapshot = sum(float(r[2] or 0) for r in wallets)
-        discord_name = next((r[3] for r in wallets if r[3]), None)
-        wallet_list = ",".join(sorted({str(r[0]) for r in wallets if r[0]}))
-
-    total_donated_usd = total_donated_snapshot + extra_usd
+        discord_name = next((r[4] for r in wallets if r[4]), None)
+        wallet_list_parts: List[str] = []
+        total_donated_usd = 0.0
+        for wallet_addr, amount_fartboy, donated_usd, donated_fartboy, _name in wallets:
+            wallet_addr = str(wallet_addr)
+            wallet_list_parts.append(wallet_addr)
+            snap_usd = float(donated_usd or 0)
+            snap_fartboy = float(donated_fartboy or 0)
+            tx_usd, tx_fartboy = tx_by_sender.get(wallet_addr, (0.0, 0.0))
+            wallet_usd = max(snap_usd, tx_usd)
+            wallet_fartboy = max(snap_fartboy, tx_fartboy)
+            total_donated_usd += wallet_usd
+            if wallet_usd > snap_usd or wallet_fartboy > snap_fartboy:
+                conn.execute(
+                    f"""
+                    UPDATE {snapshot_table}
+                    SET donated_usd = ?, donated_fartboy = ?
+                    WHERE wallet_address = ?
+                    """,
+                    (wallet_usd, wallet_fartboy, wallet_addr),
+                )
+        total_donated_usd += extra_usd
+        wallet_list = ",".join(sorted(set(wallet_list_parts)))
 
     existing = conn.execute(
         f"""
@@ -774,6 +828,125 @@ def _recompute_summary_for_discord_id(
         ),
     )
     conn.commit()
+
+
+def _ensure_summary_table(conn: sqlite3.Connection, table: str = SUMMARY_TABLE) -> None:
+    conn.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {table} (
+            discord_id TEXT PRIMARY KEY,
+            discord_name TEXT,
+            wallets TEXT,
+            total_holdings REAL NOT NULL DEFAULT 0,
+            total_donated_usd REAL NOT NULL DEFAULT 0,
+            leaderboard_visible INTEGER NOT NULL DEFAULT 0,
+            roles TEXT,
+            updated_at TEXT
+        )
+        """
+    )
+    existing_cols = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    if "roles" not in existing_cols:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN roles TEXT")
+    if "anonymous_id" not in existing_cols:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN anonymous_id INTEGER")
+    conn.commit()
+
+
+def recompute_summary_for_discord_id(
+    discord_id: str,
+    *,
+    snapshot_db: Optional[str] = None,
+    snapshot_table: Optional[str] = None,
+    tx_db_path: Optional[str] = None,
+    tx_table: Optional[str] = None,
+) -> None:
+    """Rebuild verified_users row for one Discord member (opens DB connections)."""
+    snapshot_db = snapshot_db or SNAPSHOT_DB
+    snapshot_table = snapshot_table or SNAPSHOT_TABLE
+    tx_db_path = tx_db_path or TX_DB
+    tx_table = tx_table or TX_TABLE
+    db_dir = os.path.dirname(snapshot_db)
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
+    with sqlite3.connect(snapshot_db) as conn:
+        _init_snapshot_db(conn, snapshot_table)
+        _ensure_summary_table(conn, SUMMARY_TABLE)
+        _recompute_summary_for_discord_id(
+            conn,
+            discord_id,
+            snapshot_table=snapshot_table,
+            tx_db_path=tx_db_path,
+            tx_table=tx_table,
+        )
+
+
+def recompute_summary_for_wallet(
+    wallet: str,
+    *,
+    snapshot_db: Optional[str] = None,
+    snapshot_table: Optional[str] = None,
+    tx_db_path: Optional[str] = None,
+    tx_table: Optional[str] = None,
+) -> None:
+    """Recompute summary for the Discord user linked to wallet, if any."""
+    snapshot_db = snapshot_db or SNAPSHOT_DB
+    snapshot_table = snapshot_table or SNAPSHOT_TABLE
+    try:
+        with sqlite3.connect(snapshot_db) as conn:
+            row = conn.execute(
+                f"""
+                SELECT discord_id
+                FROM {snapshot_table}
+                WHERE wallet_address = ?
+                """,
+                (wallet,),
+            ).fetchone()
+        if row and row[0]:
+            recompute_summary_for_discord_id(
+                str(row[0]),
+                snapshot_db=snapshot_db,
+                snapshot_table=snapshot_table,
+                tx_db_path=tx_db_path,
+                tx_table=tx_table,
+            )
+    except sqlite3.Error:
+        pass
+
+
+def recompute_all_verified_summaries(
+    *,
+    snapshot_db: Optional[str] = None,
+    snapshot_table: Optional[str] = None,
+    tx_db_path: Optional[str] = None,
+    tx_table: Optional[str] = None,
+) -> int:
+    """Recompute verified_users for every linked Discord ID. Returns count processed."""
+    snapshot_db = snapshot_db or SNAPSHOT_DB
+    snapshot_table = snapshot_table or SNAPSHOT_TABLE
+    tx_db_path = tx_db_path or TX_DB
+    tx_table = tx_table or TX_TABLE
+    try:
+        with sqlite3.connect(snapshot_db) as conn:
+            rows = conn.execute(
+                f"""
+                SELECT DISTINCT discord_id
+                FROM {snapshot_table}
+                WHERE discord_id IS NOT NULL
+                """,
+            ).fetchall()
+        discord_ids = [str(r[0]) for r in rows if r and r[0]]
+    except sqlite3.Error:
+        return 0
+    for did in discord_ids:
+        recompute_summary_for_discord_id(
+            did,
+            snapshot_db=snapshot_db,
+            snapshot_table=snapshot_table,
+            tx_db_path=tx_db_path,
+            tx_table=tx_table,
+        )
+    return len(discord_ids)
 
 
 def _apply_donations(
@@ -984,6 +1157,13 @@ class IncomingTracker:
                         row["sender_wallet"],
                         value_fartboy,
                         value_usdc,
+                    )
+                    recompute_summary_for_wallet(
+                        row["sender_wallet"],
+                        snapshot_db=self.snapshot_db,
+                        snapshot_table=self.snapshot_table,
+                        tx_db_path=self.tx_db,
+                        tx_table=self.tx_table,
                     )
 
                 if row.get("token") == "FARTBOY" and row.get("amount_ui", 0) < 1:

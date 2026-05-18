@@ -14,6 +14,15 @@ Members use **slash commands** (`/verifywallet`, `/verifystatus`, etc.) in the m
 4. **Transaction attribution** — Ties a specific on-chain transaction to a member (`!addtransaction … @member`), including sends from **exchange** hot wallets. This updates totals without pretending the exchange wallet is the member’s personal wallet.
 5. **Perks** — **Base** eligibility (1% rule or admin override), then higher **tiers** from total donated USD.
 
+### Donation totals (two stores)
+
+| Field | Table | Used for |
+|-------|--------|----------|
+| Per-wallet USD | `fartboy_holders.donated_usd` | **My wallets**, 1% FARTBOY progress |
+| Member total USD | `verified_users.total_donated_usd` | **Public leaderboard**, **donor tiers**, API |
+
+The bot rebuilds `verified_users` from snapshot rows plus attributed transactions. If these diverge (e.g. leaderboard shows **$0** but My wallets shows the correct amount), run **`!recomputesummaries`** in the admin channel, then **`!syncdonorroles`** if tier roles need updating.
+
 ---
 
 ## Golden rules
@@ -181,6 +190,8 @@ Fetches a transaction from the chain, records it in the **transaction database**
 
 If Alice needs **base** role but only donates via exchange: add `!setuserthreshold @Alice true`.
 
+After **`!manualverify`**, prefer **`!addtransaction SIG @Alice`** (not `SIG` alone) so the member’s `verified_users` total is rebuilt immediately. If you already recorded the tx without `@user`, run **`!recomputesummaries`** once.
+
 ---
 
 ### `!setexchangewallets EXCHANGE_NAME WALLET1 WALLET2 …`
@@ -244,7 +255,8 @@ Prints or changes OTP policy. **Default is strict.** Only use `flexible` if you 
 |---------|---------|
 | `!settier`, `!removetier`, `!tiers` | USD thresholds, emoji, roles |
 | `!setbaserole` | Role for anyone who qualifies for any tier |
-| `!syncdonorroles` | Force role/nickname sync |
+| `!recomputesummaries` | Rebuild all `verified_users.total_donated_usd` from snapshot + txs; refresh leaderboards |
+| `!syncdonorroles` | Recompute summaries, then force role/nickname sync |
 
 Members still need **base** eligibility first (1% on a linked wallet with positive snapshot holding, or `!setuserthreshold true`).
 

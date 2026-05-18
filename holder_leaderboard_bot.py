@@ -44,6 +44,9 @@ from incoming_tracker import (
     _record_used_otp,
     _check_strict_gate,
     _insert_verification_rejection,
+    recompute_summary_for_discord_id,
+    recompute_summary_for_wallet,
+    recompute_all_verified_summaries,
 )
 
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
@@ -1274,132 +1277,35 @@ def _sync_snapshot_donations(
             """,
             (sender_wallet,),
         ).fetchone()
-        if not snap_row:
-            return
-        snap_fartboy = float(snap_row[0] or 0)
-        snap_usd = float(snap_row[1] or 0)
-
-        new_fartboy = max(snap_fartboy, tx_fartboy)
-        new_usd = max(snap_usd, tx_usd)
-        if new_fartboy > snap_fartboy or new_usd > snap_usd:
+        new_fartboy = tx_fartboy
+        new_usd = tx_usd
+        if snap_row:
+            snap_fartboy = float(snap_row[0] or 0)
+            snap_usd = float(snap_row[1] or 0)
+            new_fartboy = max(snap_fartboy, tx_fartboy)
+            new_usd = max(snap_usd, tx_usd)
+            if new_fartboy > snap_fartboy or new_usd > snap_usd:
+                snapshot_conn.execute(
+                    f"""
+                    UPDATE {snapshot_table}
+                    SET donated_fartboy = ?, donated_usd = ?
+                    WHERE wallet_address = ?
+                    """,
+                    (new_fartboy, new_usd, sender_wallet),
+                )
+                snapshot_conn.commit()
+        elif new_fartboy > 0 or new_usd > 0:
             snapshot_conn.execute(
                 f"""
-                UPDATE {snapshot_table}
-                SET donated_fartboy = ?, donated_usd = ?
-                WHERE wallet_address = ?
+                INSERT INTO {snapshot_table}
+                    (wallet_address, amount_fartboy, donated_fartboy, donated_usd)
+                VALUES (?, 0, ?, ?)
                 """,
-                (new_fartboy, new_usd, sender_wallet),
+                (sender_wallet, new_fartboy, new_usd),
             )
             snapshot_conn.commit()
     except sqlite3.Error as exc:
         log.warning("Failed to sync snapshot donations for %s: %s", sender_wallet, exc)
-
-
-def _recompute_summary_for_discord_id(discord_id: str) -> None:
-    """Rebuild SUMMARY_TABLE row from verified snapshot wallets plus tx-only attribution.
-
-    Donations from senders verified to this user are counted via snapshot donated_usd.
-    Additional rows in the tx table with this discord_id but sender not in that wallet set
-    (e.g. exchange hot wallets linked via !addtransaction) are summed so totals stay correct.
-    """
-    try:
-        wallets: List[Tuple] = []
-        with _connect_db(SNAPSHOT_DB) as conn:
-            wallets = conn.execute(
-                f"""
-                SELECT wallet_address, amount_fartboy, donated_usd, discord_name
-                FROM {SNAPSHOT_TABLE}
-                WHERE discord_id = ?
-                """,
-                (discord_id,),
-            ).fetchall()
-
-        verified_wallets = {str(r[0]) for r in wallets if r and r[0]}
-        extra_usd = 0.0
-        try:
-            with _connect_db(TX_DB) as tx_conn:
-                if verified_wallets:
-                    placeholders = ",".join("?" * len(verified_wallets))
-                    row = tx_conn.execute(
-                        f"""
-                        SELECT COALESCE(SUM(value_usdc), 0)
-                        FROM {TX_TABLE}
-                        WHERE discord_id = ?
-                          AND sender_wallet NOT IN ({placeholders})
-                        """,
-                        (discord_id, *verified_wallets),
-                    ).fetchone()
-                else:
-                    row = tx_conn.execute(
-                        f"""
-                        SELECT COALESCE(SUM(value_usdc), 0)
-                        FROM {TX_TABLE}
-                        WHERE discord_id = ?
-                        """,
-                        (discord_id,),
-                    ).fetchone()
-                extra_usd = float(row[0] or 0) if row else 0.0
-        except sqlite3.Error as exc:
-            log.error("Failed to sum attributed txs for summary: %s", exc)
-            extra_usd = 0.0
-
-        with _connect_db(SNAPSHOT_DB) as conn:
-            if not wallets:
-                if extra_usd <= 0:
-                    return
-                total_holdings = 0.0
-                total_donated_snapshot = 0.0
-                name_row = conn.execute(
-                    f"SELECT discord_name FROM {SUMMARY_TABLE} WHERE discord_id = ?",
-                    (discord_id,),
-                ).fetchone()
-                discord_name = name_row[0] if name_row and name_row[0] else None
-                wallet_list = ""
-            else:
-                total_holdings = sum(float(r[1] or 0) for r in wallets)
-                total_donated_snapshot = sum(float(r[2] or 0) for r in wallets)
-                discord_name = next((r[3] for r in wallets if r[3]), None)
-                wallet_list = ",".join(sorted({str(r[0]) for r in wallets if r[0]}))
-
-            total_donated_usd = total_donated_snapshot + extra_usd
-
-            existing = conn.execute(
-                f"""
-                SELECT leaderboard_visible, roles
-                FROM {SUMMARY_TABLE}
-                WHERE discord_id = ?
-                """,
-                (discord_id,),
-            ).fetchone()
-            leaderboard_visible = int(existing[0]) if existing else 0
-            roles = existing[1] if existing else None
-            conn.execute(
-                f"""
-                INSERT INTO {SUMMARY_TABLE} (
-                    discord_id, discord_name, wallets, total_holdings,
-                    total_donated_usd, leaderboard_visible, roles, updated_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
-                ON CONFLICT(discord_id) DO UPDATE SET
-                    discord_name = excluded.discord_name,
-                    wallets = excluded.wallets,
-                    total_holdings = excluded.total_holdings,
-                    total_donated_usd = excluded.total_donated_usd,
-                    updated_at = datetime('now')
-                """,
-                (
-                    discord_id,
-                    discord_name,
-                    wallet_list,
-                    total_holdings,
-                    total_donated_usd,
-                    leaderboard_visible,
-                    roles,
-                ),
-            )
-            conn.commit()
-    except sqlite3.Error as exc:
-        log.error("Failed to recompute summary: %s", exc)
 
 
 def _set_summary_visibility(discord_id: str, visible: int) -> None:
@@ -1645,6 +1551,13 @@ async def _process_signature(signature: str, discord_id: str | None = None) -> T
                     value_fartboy,
                     value_usdc,
                 )
+                recompute_summary_for_wallet(
+                    row["sender_wallet"],
+                    snapshot_db=SNAPSHOT_DB,
+                    snapshot_table=SNAPSHOT_TABLE,
+                    tx_db_path=TX_DB,
+                    tx_table=TX_TABLE,
+                )
             elif row_discord_id:
                 _sync_snapshot_donations(
                     snapshot_conn,
@@ -1652,6 +1565,13 @@ async def _process_signature(signature: str, discord_id: str | None = None) -> T
                     SNAPSHOT_TABLE,
                     TX_TABLE,
                     row["sender_wallet"],
+                )
+                recompute_summary_for_wallet(
+                    row["sender_wallet"],
+                    snapshot_db=SNAPSHOT_DB,
+                    snapshot_table=SNAPSHOT_TABLE,
+                    tx_db_path=TX_DB,
+                    tx_table=TX_TABLE,
                 )
             if row_discord_id:
                 tx_conn.execute(
@@ -1732,10 +1652,16 @@ async def _process_signature(signature: str, discord_id: str | None = None) -> T
                         (otp_discord_id, otp_discord_name, row["sender_wallet"], otp_discord_id),
                     )
                     snapshot_conn.commit()
-                    _recompute_summary_for_discord_id(otp_discord_id)
+                    recompute_summary_for_discord_id(otp_discord_id)
                 break
     if attribution_discord_id:
-        _recompute_summary_for_discord_id(attribution_discord_id)
+        recompute_summary_for_discord_id(
+            attribution_discord_id,
+            snapshot_db=SNAPSHOT_DB,
+            snapshot_table=SNAPSHOT_TABLE,
+            tx_db_path=TX_DB,
+            tx_table=TX_TABLE,
+        )
     return len(rows), inserted
 
 
@@ -1917,7 +1843,7 @@ def _clear_verification_for_wallets(wallets: List[str]) -> int:
                     )
                     conn.commit()
                     continue
-            _recompute_summary_for_discord_id(discord_id)
+            recompute_summary_for_discord_id(discord_id)
         return len(wallets)
     except sqlite3.Error as exc:
         log.error("Failed to clear verification wallets: %s", exc)
@@ -2184,7 +2110,7 @@ class VerificationButtonsView(discord.ui.View):
             )
         _update_visibility_by_discord(discord_id, str(interaction.user), 1)
         _set_summary_visibility(discord_id, 1)
-        _recompute_summary_for_discord_id(discord_id)
+        recompute_summary_for_discord_id(discord_id)
         await interaction.response.send_message(
             "Your name is now **visible** on the leaderboard. You can change this anytime.",
             ephemeral=True,
@@ -2213,7 +2139,7 @@ class VerificationButtonsView(discord.ui.View):
             )
         _update_visibility_by_discord(discord_id, str(interaction.user), 0)
         _set_summary_visibility(discord_id, 0)
-        _recompute_summary_for_discord_id(discord_id)
+        recompute_summary_for_discord_id(discord_id)
         await interaction.response.send_message(
             "You are now **anonymous** on the leaderboard. Your donations show as 'Anonymous donor'.",
             ephemeral=True,
@@ -2367,9 +2293,22 @@ class LeaderboardBot(commands.Bot):
             return
         try:
             count, wallets, verified_ids = await self._tracker.run_once()
-            discord_ids = {did for w in wallets if (did := _discord_id_for_wallet(w))}
-            for did in discord_ids:
-                _recompute_summary_for_discord_id(did)
+            for w in wallets:
+                recompute_summary_for_wallet(
+                    w,
+                    snapshot_db=SNAPSHOT_DB,
+                    snapshot_table=SNAPSHOT_TABLE,
+                    tx_db_path=TX_DB,
+                    tx_table=TX_TABLE,
+                )
+            for did in verified_ids:
+                recompute_summary_for_discord_id(
+                    did,
+                    snapshot_db=SNAPSHOT_DB,
+                    snapshot_table=SNAPSHOT_TABLE,
+                    tx_db_path=TX_DB,
+                    tx_table=TX_TABLE,
+                )
             if (count > 0 or verified_ids) and GUILD_ID:
                 guild = self.get_guild(int(GUILD_ID))
                 if guild:
@@ -2447,7 +2386,7 @@ async def set_leaderboard_visibility(
         ephemeral=True,
     )
     _set_summary_visibility(str(interaction.user.id), 1 if on_leaderboard else 0)
-    _recompute_summary_for_discord_id(str(interaction.user.id))
+    recompute_summary_for_discord_id(str(interaction.user.id))
     await bot._refresh_leaderboards()
 
 
@@ -2651,11 +2590,19 @@ async def verify_status(interaction: discord.Interaction):
                 did for w in wallets if (did := _discord_id_for_wallet(w))
             }
             for did in discord_ids:
-                _recompute_summary_for_discord_id(did)
+                recompute_summary_for_discord_id(did)
             if count:
                 log.info("On-demand tracker run found %s new transactions.", count)
         except Exception as exc:
             log.warning("On-demand tracker run failed: %s", exc)
+
+    recompute_summary_for_discord_id(
+        discord_id,
+        snapshot_db=SNAPSHOT_DB,
+        snapshot_table=SNAPSHOT_TABLE,
+        tx_db_path=TX_DB,
+        tx_table=TX_TABLE,
+    )
 
     verified_wallets = _find_wallets_for_discord_id(discord_id)
 
@@ -3083,9 +3030,18 @@ _COMMAND_HELP: Dict[str, Dict[str, str]] = {
         "summary": "Force a full donor role and nickname sync.",
         "usage": "`!syncdonorroles`",
         "details": (
-            "Re-evaluates every verified user against the configured tiers and updates "
+            "Recomputes verified_users donation totals from snapshot and transaction data, "
+            "then re-evaluates every verified user against the configured tiers and updates "
             "their Discord roles and nickname emoji prefix. Normally this runs automatically "
             "after each tracker cycle, but this command triggers it manually."
+        ),
+    },
+    "recomputesummaries": {
+        "summary": "Rebuild verified_users donation totals for all linked members.",
+        "usage": "`!recomputesummaries`",
+        "details": (
+            "Fixes stale leaderboard amounts and tier sync when snapshot donated_usd "
+            "and verified_users.total_donated_usd have diverged. Refreshes leaderboard embeds."
         ),
     },
 }
@@ -3161,6 +3117,7 @@ def _build_help_embed(command_name: Optional[str]) -> discord.Embed:
             "settier",
             "removetier",
             "tiers",
+            "recomputesummaries",
             "syncdonorroles",
         ],
         "Admin utilities": [
@@ -3229,7 +3186,16 @@ async def snapshotholders(ctx: commands.Context):
             log.info("Snapshot output: %s", result.stdout.strip())
         if result.stderr:
             log.warning("Snapshot stderr: %s", result.stderr.strip())
-        await ctx.send("Snapshot completed.")
+        n = recompute_all_verified_summaries(
+            snapshot_db=SNAPSHOT_DB,
+            snapshot_table=SNAPSHOT_TABLE,
+            tx_db_path=TX_DB,
+            tx_table=TX_TABLE,
+        )
+        await bot._refresh_leaderboards()
+        await ctx.send(
+            f"Snapshot completed. Recomputed donation summaries for **{n}** verified user(s)."
+        )
     except subprocess.CalledProcessError as exc:
         log.exception("Snapshot failed: %s", exc)
         stderr = (exc.stderr or "").strip()
@@ -3316,7 +3282,7 @@ async def manualverify(
             log.error("Failed to insert snapshot row for manual verify: %s", exc)
             return await ctx.send("Failed to create snapshot row. Check logs.")
     _set_summary_visibility(discord_id, on_leaderboard)
-    _recompute_summary_for_discord_id(discord_id)
+    recompute_summary_for_discord_id(discord_id)
     try:
         with _connect_db(TX_DB) as tx_conn:
             tx_conn.execute(
@@ -3484,7 +3450,7 @@ async def setexchangewallets(ctx: commands.Context, exchange_name: str = "", *wa
                     )
                     conn.commit()
                     continue
-            _recompute_summary_for_discord_id(discord_id)
+            recompute_summary_for_discord_id(discord_id)
         await ctx.send(
             f"Recorded {len(cleaned)} exchange wallet(s) for `{exchange_name}`."
         )
@@ -3767,6 +3733,26 @@ async def tiers_cmd(ctx: commands.Context):
     await ctx.send("\n".join(lines))
 
 
+@bot.command(name="recomputesummaries")
+async def recomputesummaries(ctx: commands.Context):
+    """Rebuild verified_users totals from snapshot + tx data."""
+    await ctx.send("Recomputing donation summaries...")
+    try:
+        n = recompute_all_verified_summaries(
+            snapshot_db=SNAPSHOT_DB,
+            snapshot_table=SNAPSHOT_TABLE,
+            tx_db_path=TX_DB,
+            tx_table=TX_TABLE,
+        )
+        await bot._refresh_leaderboards()
+        await ctx.send(
+            f"Recomputed donation summaries for **{n}** verified user(s) and refreshed leaderboards."
+        )
+    except sqlite3.Error as exc:
+        log.exception("recomputesummaries failed: %s", exc)
+        await ctx.send("Failed to recompute summaries. Check logs.")
+
+
 @bot.command(name="syncdonorroles")
 async def syncdonorroles(ctx: commands.Context):
     """Force a full donor role and nickname sync for all verified users."""
@@ -3777,6 +3763,13 @@ async def syncdonorroles(ctx: commands.Context):
         return await ctx.send("Could not find the configured guild.")
     await ctx.send("Starting donor role sync...")
     try:
+        n = recompute_all_verified_summaries(
+            snapshot_db=SNAPSHOT_DB,
+            snapshot_table=SNAPSHOT_TABLE,
+            tx_db_path=TX_DB,
+            tx_table=TX_TABLE,
+        )
+        log.info("Recomputed %s verified user summaries before role sync.", n)
         counts = await sync_donor_roles(guild)
         parts = [
             f"Donor role sync complete.",
