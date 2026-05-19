@@ -1340,6 +1340,21 @@ def _find_wallets_for_discord_id(discord_id: str) -> List[str]:
         return []
 
 
+def _has_donations(discord_id: str) -> bool:
+    """Check if a user has verified wallets OR a summary row with donations."""
+    if _find_wallets_for_discord_id(discord_id):
+        return True
+    try:
+        with _connect_db(SNAPSHOT_DB) as conn:
+            row = conn.execute(
+                f"SELECT total_donated_usd FROM {SUMMARY_TABLE} WHERE discord_id = ?",
+                (discord_id,),
+            ).fetchone()
+        return bool(row and float(row[0] or 0) > 0)
+    except sqlite3.Error:
+        return False
+
+
 def _discord_id_for_wallet(wallet: str) -> str | None:
     try:
         with _connect_db(SNAPSHOT_DB) as conn:
@@ -1658,13 +1673,14 @@ async def _process_signature(signature: str, discord_id: str | None = None) -> T
             tx_conn.commit()
             if cur.rowcount == 1:
                 inserted += 1
-                _apply_donations(
-                    snapshot_conn,
-                    SNAPSHOT_TABLE,
-                    row["sender_wallet"],
-                    value_fartboy,
-                    value_usdc,
-                )
+                if row["sender_wallet"] not in exchange_wallets:
+                    _apply_donations(
+                        snapshot_conn,
+                        SNAPSHOT_TABLE,
+                        row["sender_wallet"],
+                        value_fartboy,
+                        value_usdc,
+                    )
                 recompute_summary_for_wallet(
                     row["sender_wallet"],
                     snapshot_db=SNAPSHOT_DB,
@@ -1672,22 +1688,15 @@ async def _process_signature(signature: str, discord_id: str | None = None) -> T
                     tx_db_path=TX_DB,
                     tx_table=TX_TABLE,
                 )
+                if row_discord_id:
+                    recompute_summary_for_discord_id(
+                        row_discord_id,
+                        snapshot_db=SNAPSHOT_DB,
+                        snapshot_table=SNAPSHOT_TABLE,
+                        tx_db_path=TX_DB,
+                        tx_table=TX_TABLE,
+                    )
             elif row_discord_id:
-                _sync_snapshot_donations(
-                    snapshot_conn,
-                    tx_conn,
-                    SNAPSHOT_TABLE,
-                    TX_TABLE,
-                    row["sender_wallet"],
-                )
-                recompute_summary_for_wallet(
-                    row["sender_wallet"],
-                    snapshot_db=SNAPSHOT_DB,
-                    snapshot_table=SNAPSHOT_TABLE,
-                    tx_db_path=TX_DB,
-                    tx_table=TX_TABLE,
-                )
-            if row_discord_id:
                 tx_conn.execute(
                     f"""
                     UPDATE {TX_TABLE}
@@ -1706,6 +1715,28 @@ async def _process_signature(signature: str, discord_id: str | None = None) -> T
                     ),
                 )
                 tx_conn.commit()
+                if row["sender_wallet"] not in exchange_wallets:
+                    _sync_snapshot_donations(
+                        snapshot_conn,
+                        tx_conn,
+                        SNAPSHOT_TABLE,
+                        TX_TABLE,
+                        row["sender_wallet"],
+                    )
+                    recompute_summary_for_wallet(
+                        row["sender_wallet"],
+                        snapshot_db=SNAPSHOT_DB,
+                        snapshot_table=SNAPSHOT_TABLE,
+                        tx_db_path=TX_DB,
+                        tx_table=TX_TABLE,
+                    )
+                recompute_summary_for_discord_id(
+                    row_discord_id,
+                    snapshot_db=SNAPSHOT_DB,
+                    snapshot_table=SNAPSHOT_TABLE,
+                    tx_db_path=TX_DB,
+                    tx_table=TX_TABLE,
+                )
         # Always attempt OTP matching for small FARTBOY transfers, even if the
         # transaction already exists or pricing was unavailable.
         # Mirror: incoming_tracker.py IncomingTracker.run_once has the same
@@ -2288,7 +2319,7 @@ class VerificationButtonsView(discord.ui.View):
         self, interaction: discord.Interaction, button: discord.ui.Button
     ):
         discord_id = str(interaction.user.id)
-        if not _find_wallets_for_discord_id(discord_id):
+        if not _has_donations(discord_id):
             return await interaction.response.send_message(
                 "No verified wallet found. Use the Verify wallet button first.",
                 ephemeral=True,
@@ -2317,7 +2348,7 @@ class VerificationButtonsView(discord.ui.View):
         self, interaction: discord.Interaction, button: discord.ui.Button
     ):
         discord_id = str(interaction.user.id)
-        if not _find_wallets_for_discord_id(discord_id):
+        if not _has_donations(discord_id):
             return await interaction.response.send_message(
                 "No verified wallet found. Use the Verify wallet button first.",
                 ephemeral=True,
@@ -2563,12 +2594,13 @@ async def set_leaderboard_visibility(
     interaction: discord.Interaction,
     on_leaderboard: bool,
 ):
-    success = _update_visibility_by_discord(
-        discord_id=str(interaction.user.id),
+    discord_id = str(interaction.user.id)
+    _update_visibility_by_discord(
+        discord_id=discord_id,
         discord_name=interaction.user.display_name,
         on_leaderboard=1 if on_leaderboard else 0,
     )
-    if not success:
+    if not _has_donations(discord_id):
         return await interaction.response.send_message(
             "No verified wallet found for your Discord user. Run /verifywallet first.",
             ephemeral=True,
@@ -2577,8 +2609,8 @@ async def set_leaderboard_visibility(
         "Updated leaderboard visibility.",
         ephemeral=True,
     )
-    _set_summary_visibility(str(interaction.user.id), 1 if on_leaderboard else 0)
-    recompute_summary_for_discord_id(str(interaction.user.id))
+    _set_summary_visibility(discord_id, 1 if on_leaderboard else 0)
+    recompute_summary_for_discord_id(discord_id)
     await bot._refresh_leaderboards()
 
 
@@ -3662,8 +3694,8 @@ async def setvisibility(ctx: commands.Context, member: discord.Member | None = N
     discord_id = str(member.id)
     discord_name = member.display_name
     visible = 1 if value == "visible" else 0
-    ok = _update_visibility_by_discord(discord_id, discord_name, visible)
-    if not ok:
+    _update_visibility_by_discord(discord_id, discord_name, visible)
+    if not _has_donations(discord_id):
         return await ctx.send(
             f"No verified wallet found for {member.mention}. They need to verify first."
         )
