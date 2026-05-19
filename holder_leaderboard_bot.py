@@ -331,7 +331,7 @@ def _update_target_completion(total_raised: float) -> None:
         log.error("Failed to update target completion: %s", exc)
 
 
-def _fetch_next_target(total_raised: float) -> Dict | None:
+def _fetch_next_target(total_raised: float = 0) -> Dict | None:
     """Fetch the next uncompleted target."""
     try:
         with _connect_db(STATE_DB) as conn:
@@ -339,11 +339,10 @@ def _fetch_next_target(total_raised: float) -> Dict | None:
                 """
                 SELECT id, target_amount, target_name, created_at, order_index
                 FROM targets
-                WHERE is_active = 1 AND (completed_at IS NULL OR target_amount > ?)
+                WHERE is_active = 1 AND completed_at IS NULL
                 ORDER BY order_index ASC
                 LIMIT 1
-                """,
-                (total_raised,),
+                """
             ).fetchone()
         if not row:
             return None
@@ -1925,13 +1924,13 @@ def _render_progress_bar(current: float, target: float, width: int = 20) -> str:
 
 def _render_target_field(total_raised: float) -> str | None:
     """Build the target/milestone progress string for the embed."""
-    _update_target_completion(total_raised)
     next_target = _fetch_next_target(total_raised)
     if not next_target:
         return None
     amount = next_target["target_amount"]
     name = next_target.get("target_name")
-    bar = _render_progress_bar(total_raised, amount)
+    capped = min(total_raised, amount)
+    bar = _render_progress_bar(capped, amount)
     label = f'{name} — ' if name else ""
     return f"{label}${total_raised:,.2f} / ${amount:,.2f}\n{bar}"
 
@@ -2714,7 +2713,7 @@ async def verify_wallet_otp(interaction: discord.Interaction):
     await interaction.response.send_message(instructions, ephemeral=True)
     await interaction.followup.send("War chest address:", ephemeral=True)
     await interaction.followup.send(f"{war_chest}", ephemeral=True)
-    await interaction.followup.send("Amount:", ephemeral=True)
+    await interaction.followup.send("Amount in FARTBOY:", ephemeral=True)
     await interaction.followup.send(f"{otp_value}", ephemeral=True)
 
 
@@ -2966,13 +2965,13 @@ async def setdonationleaderboard(
     )
     await channel.send(war_chest)
     info = (
-        "**How to verify your wallet:**\n"
+        "## How to verify your wallet:\n"
         "1. Donate at least **1% of your FARTBOY snapshot balance** to the war chest.\n"
         "2. Click **Verify wallet** to get a unique OTP amount.\n"
         "3. Send that exact OTP amount of FARTBOY to the war chest.\n"
         "4. Click **Verify status** to confirm — done!\n\n"
         "Choosing to appear on the leaderboard is optional and does not affect perks.\n"
-        "If something doesn't work or you need help, ask the mods."
+        "If something doesn't work or you need help, ask the mods through a ticket in <#1346931977068089347>."
     )
     await channel.send(info, view=VerificationButtonsView())
 
@@ -3161,6 +3160,14 @@ _COMMAND_HELP: Dict[str, Dict[str, str]] = {
             "(snapshot discord_id / OTP are unchanged for exchange senders)."
         ),
     },
+    "removetransaction": {
+        "summary": "Remove a transaction from the donation system.",
+        "usage": "`!removetransaction SIGNATURE`",
+        "details": (
+            "Deletes the transaction record and recalculates the affected wallet's donation totals. "
+            "Use when an incoming transfer is not a donation (e.g. moving funds between your own wallets)."
+        ),
+    },
     "donationbothelp": {
         "summary": "Legacy help command.",
         "usage": "`!donationbothelp`",
@@ -3175,6 +3182,11 @@ _COMMAND_HELP: Dict[str, Dict[str, str]] = {
         "summary": "Remove a fundraising target by ID.",
         "usage": "`!removetarget <id>`",
         "details": "Use `!targets` to see target IDs.",
+    },
+    "completetarget": {
+        "summary": "Manually mark a target as completed.",
+        "usage": "`!completetarget <id>`",
+        "details": "Marks the target as done so the progress bar moves to the next one. Use `!targets` to see IDs.",
     },
     "targets": {
         "summary": "Show all active targets and progress.",
@@ -3320,11 +3332,13 @@ def _build_help_embed(command_name: Optional[str]) -> discord.Embed:
         "Transactions": [
             "tx",
             "addtransaction",
+            "removetransaction",
             "checkwallet",
         ],
         "Targets": [
             "settarget",
             "removetarget",
+            "completetarget",
             "targets",
         ],
         "Donor Tiers": [
@@ -3839,6 +3853,70 @@ async def addtransaction(ctx: commands.Context, signature: str = ""):
         )
 
 
+@bot.command(name="removetransaction")
+async def removetransaction(ctx: commands.Context, signature: str = ""):
+    """Remove a transaction from the donation system. Usage: !removetransaction SIGNATURE"""
+    if not signature:
+        return await ctx.send("Usage: `!removetransaction SIGNATURE`")
+    signature = signature.strip()
+    try:
+        _ensure_tx_table()
+        with sqlite3.connect(TX_DB) as tx_conn:
+            row = tx_conn.execute(
+                f"SELECT sender_wallet, discord_id, value_usdc, value_fartboy FROM {TX_TABLE} WHERE signature = ?",
+                (signature,),
+            ).fetchone()
+            if not row:
+                return await ctx.send("Transaction not found in the database.")
+            sender_wallet, discord_id, value_usdc, value_fartboy = row
+            tx_conn.execute(
+                f"DELETE FROM {TX_TABLE} WHERE signature = ?",
+                (signature,),
+            )
+            tx_conn.commit()
+
+        if sender_wallet:
+            with _connect_db(SNAPSHOT_DB) as snap_conn:
+                with sqlite3.connect(TX_DB) as tx_conn2:
+                    agg = tx_conn2.execute(
+                        f"SELECT COALESCE(SUM(value_fartboy), 0), COALESCE(SUM(value_usdc), 0) FROM {TX_TABLE} WHERE sender_wallet = ?",
+                        (sender_wallet,),
+                    ).fetchone()
+                new_fartboy = float(agg[0]) if agg else 0.0
+                new_usd = float(agg[1]) if agg else 0.0
+                snap_conn.execute(
+                    f"UPDATE {SNAPSHOT_TABLE} SET donated_fartboy = ?, donated_usd = ? WHERE wallet_address = ?",
+                    (new_fartboy, new_usd, sender_wallet),
+                )
+                snap_conn.commit()
+            recompute_summary_for_wallet(
+                sender_wallet,
+                snapshot_db=SNAPSHOT_DB,
+                snapshot_table=SNAPSHOT_TABLE,
+                tx_db_path=TX_DB,
+                tx_table=TX_TABLE,
+            )
+
+        if discord_id:
+            recompute_summary_for_discord_id(
+                discord_id,
+                snapshot_db=SNAPSHOT_DB,
+                snapshot_table=SNAPSHOT_TABLE,
+                tx_db_path=TX_DB,
+                tx_table=TX_TABLE,
+            )
+
+        await bot._refresh_leaderboards()
+        parts = [f"Transaction `{signature[:8]}…{signature[-4:]}` removed."]
+        parts.append(f"USD removed: ${float(value_usdc or 0):,.2f}")
+        if discord_id:
+            parts.append(f"Was attributed to <@{discord_id}>; their totals have been recalculated.")
+        await ctx.send("\n".join(parts))
+    except sqlite3.Error as exc:
+        log.error("Failed to remove transaction: %s", exc)
+        await ctx.send("Failed to remove transaction. Check logs.")
+
+
 @setdonationleaderboard.error
 @setdonationleadersize.error
 async def setleaderboard_error(ctx: commands.Context, error: Exception):
@@ -3885,12 +3963,41 @@ async def removetarget(ctx: commands.Context, target_id: str = ""):
         await ctx.send(f"Target #{tid} not found or already removed.")
 
 
+@bot.command(name="completetarget")
+async def completetarget(ctx: commands.Context, target_id: str = ""):
+    """Manually mark a target as completed. Usage: !completetarget <id>"""
+    if not target_id:
+        return await ctx.send("Usage: `!completetarget <id>`\nUse `!targets` to see all targets and their IDs.")
+    try:
+        tid = int(target_id)
+    except ValueError:
+        return await ctx.send("Target ID must be a number.")
+    try:
+        with _connect_db(STATE_DB) as conn:
+            cur = conn.execute(
+                """
+                UPDATE targets
+                SET completed_at = datetime('now')
+                WHERE id = ? AND is_active = 1 AND completed_at IS NULL
+                """,
+                (tid,),
+            )
+            conn.commit()
+            if cur.rowcount > 0:
+                await ctx.send(f"Target #{tid} marked as completed.")
+                await bot._refresh_leaderboards()
+            else:
+                await ctx.send(f"Target #{tid} not found, already completed, or inactive.")
+    except sqlite3.Error as exc:
+        log.error("Failed to complete target: %s", exc)
+        await ctx.send("Failed to complete target. Check logs.")
+
+
 @bot.command(name="targets")
 async def targets_cmd(ctx: commands.Context):
     """Show all active fundraising targets."""
     targets = _fetch_targets()
     total_raised = _fetch_total_donations_usd()
-    _update_target_completion(total_raised)
 
     if not targets:
         return await ctx.send("No active targets set. Admins can use `!settarget <amount> [name]`.")
@@ -3905,17 +4012,19 @@ async def targets_cmd(ctx: commands.Context):
             f"#{t['id']}: **${t['target_amount']:,.2f}**{label} — {status}"
         )
 
-    next_target = _fetch_next_target(total_raised)
+    next_target = _fetch_next_target()
     if next_target:
         progress = (total_raised / next_target["target_amount"] * 100) if next_target["target_amount"] > 0 else 0
+        progress = min(100.0, progress)
         label = f' ({next_target["target_name"]})' if next_target.get("target_name") else ""
-        lines.append(f"\n**Next target:** ${next_target['target_amount']:,.2f}{label} — {min(100.0, progress):.1f}%")
+        lines.append(f"\n**Next target:** ${next_target['target_amount']:,.2f}{label} — {progress:.1f}%")
 
     await ctx.send("\n".join(lines))
 
 
 @settarget.error
 @removetarget.error
+@completetarget.error
 async def target_error(ctx: commands.Context, error: Exception):
     if isinstance(error, commands.MissingPermissions):
         await ctx.send("You need **Manage Server** to run this.")

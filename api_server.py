@@ -205,7 +205,7 @@ def _fetch_targets(total_raised: float) -> Tuple[List[Dict], Optional[Dict]]:
             ).fetchall()
         for r in rows:
             target_amount = float(r[1])
-            completed = r[5] is not None and target_amount <= total_raised
+            completed = r[5] is not None
             progress = (total_raised / target_amount * 100) if target_amount > 0 else 0
             progress = min(100.0, progress)
             t = {
