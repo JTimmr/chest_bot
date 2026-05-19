@@ -189,7 +189,7 @@ def _fetch_leaderboard() -> Tuple[List[Dict[str, Any]], float]:
     return entries, total_raised
 
 
-def _fetch_targets(total_raised: float) -> Tuple[List[Dict], Optional[Dict]]:
+def _fetch_targets(chest_value: float) -> Tuple[List[Dict], Optional[Dict]]:
     """Fetch all active targets and identify the next one."""
     targets = []
     next_target = None
@@ -206,7 +206,7 @@ def _fetch_targets(total_raised: float) -> Tuple[List[Dict], Optional[Dict]]:
         for r in rows:
             target_amount = float(r[1])
             completed = r[5] is not None
-            progress = (total_raised / target_amount * 100) if target_amount > 0 else 0
+            progress = (chest_value / target_amount * 100) if target_amount > 0 else 0
             progress = min(100.0, progress)
             t = {
                 "id": r[0],
@@ -305,27 +305,34 @@ def create_api_app() -> FastAPI:
         """
         Overall statistics.
 
-        Returns total raised (USD), breakdown by token (USDC, USDT, FARTBOY, SOL),
-        all active targets with progress, and the next uncompleted target.
+        Returns total raised (USD), current chest value, breakdown by token
+        (USDC, USDT, FARTBOY, SOL), all active targets with progress, and the
+        next uncompleted target. Target progress is based on current chest value
+        (matching the Discord leaderboard display).
 
         **Data types & boundaries:**
 
         | Field | Type | Range | Description |
         |---|---|---|---|
         | total_raised_usd | float | [0, ∞) | Sum of all donations in USD |
+        | chest_value_usd | float | [0, ∞) | Current chest wallet value in USD |
         | raised_by_token.* | float | [0, ∞) | USD raised per token type |
         | targets[].target_amount | float | (0, ∞) | Milestone amount in USD |
-        | targets[].progress_percent | float | [0, 100] | % progress toward target |
+        | targets[].progress_percent | float | [0, 100] | % progress toward target (based on chest value) |
         | next_target | object or null | — | First uncompleted target |
         """
         _verify_api_key(x_api_key)
 
         total_raised = _fetch_total_donations_usd()
         by_token = _fetch_total_by_token()
-        targets, next_target = _fetch_targets(total_raised)
+
+        from holder_leaderboard_bot import _get_chest_value_usd
+        chest_value = _get_chest_value_usd()
+        targets, next_target = _fetch_targets(chest_value)
 
         return {
             "total_raised_usd": round(total_raised, 2),
+            "chest_value_usd": round(chest_value, 2),
             "raised_by_token": {k: round(v, 2) for k, v in by_token.items()},
             "targets": targets,
             "next_target": next_target,

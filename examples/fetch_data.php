@@ -146,7 +146,7 @@ function chest_stats_shortcode() {
         $next = $data['next_target'];
         $html .= '<div class="chest-next-target">';
         $html .= '<p><strong>Next milestone:</strong> ' . esc_html($next['target_name']);
-        $html .= ' — $' . number_format($data['total_raised_usd'], 2);
+        $html .= ' — $' . number_format($data['chest_value_usd'], 2);
         $html .= ' / $' . number_format($next['target_amount'], 0);
         $html .= ' (' . number_format($next['progress_percent'], 1) . '%)</p>';
         $html .= '</div>';
@@ -172,7 +172,7 @@ add_shortcode('chest_stats', 'chest_stats_shortcode');
 //   entries[].donated_usd, entries[].is_anonymous, total_entries
 //
 // /api/v1/stats:
-//   total_raised_usd,
+//   total_raised_usd, chest_value_usd,
 //   raised_by_token.USDC, raised_by_token.USDT,
 //   raised_by_token.FARTBOY, raised_by_token.SOL,
 //   targets[].id, targets[].target_amount, targets[].target_name,
