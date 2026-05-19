@@ -1230,13 +1230,11 @@ class IncomingTracker:
 
             computed = await _compute_values_for_rows(rows, self.fartboy_mint, self._last_known_prices)
             if not computed:
-                computed = []
-                for row in rows:
-                    if row.get("token") == "FARTBOY":
-                        computed.append((row, 0.0, float(row.get("amount_ui", 0))))
-                    else:
-                        computed.append((row, 0.0, 0.0))
-                print("Price lookup failed; inserting with fallback values (usdc=0).")
+                print(
+                    f"Price lookup failed for {len(rows)} transaction(s); "
+                    "deferring to next cycle."
+                )
+                return 0, [], []
 
             sender_wallets: List[str] = []
             verified_discord_ids: List[str] = []
