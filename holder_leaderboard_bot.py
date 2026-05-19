@@ -909,10 +909,10 @@ async def sync_donor_roles(guild: discord.Guild) -> Dict[str, int]:
                 conn.execute(
                     f"""
                     UPDATE {SUMMARY_TABLE}
-                    SET roles = ?
+                    SET discord_name = ?, roles = ?
                     WHERE discord_id = ?
                     """,
-                    (f"{base_role.name},{target_tier['role_name']}", discord_id),
+                    (member.display_name, f"{base_role.name},{target_tier['role_name']}", discord_id),
                 )
                 conn.commit()
         except sqlite3.Error:
@@ -2269,7 +2269,7 @@ class VerificationButtonsView(discord.ui.View):
                 "You are already visible on the leaderboard.",
                 ephemeral=True,
             )
-        _update_visibility_by_discord(discord_id, str(interaction.user), 1)
+        _update_visibility_by_discord(discord_id, interaction.user.display_name, 1)
         _set_summary_visibility(discord_id, 1)
         recompute_summary_for_discord_id(discord_id)
         await interaction.response.send_message(
@@ -2298,7 +2298,7 @@ class VerificationButtonsView(discord.ui.View):
                 "You are already anonymous on the leaderboard.",
                 ephemeral=True,
             )
-        _update_visibility_by_discord(discord_id, str(interaction.user), 0)
+        _update_visibility_by_discord(discord_id, interaction.user.display_name, 0)
         _set_summary_visibility(discord_id, 0)
         recompute_summary_for_discord_id(discord_id)
         await interaction.response.send_message(
@@ -2454,6 +2454,7 @@ class LeaderboardBot(commands.Bot):
                 self._tracker_disabled_logged = True
             return
         try:
+            await _refresh_chest_value()
             count, wallets, verified_ids = await self._tracker.run_once()
             for w in wallets:
                 recompute_summary_for_wallet(
@@ -2475,7 +2476,6 @@ class LeaderboardBot(commands.Bot):
                 guild = self.get_guild(int(GUILD_ID))
                 if guild:
                     await sync_donor_roles(guild)
-            await _refresh_chest_value()
             log.info("Tracker tick complete. New transactions: %s", count)
         except Exception as exc:
             log.exception("Tracker tick failed: %s", exc)
@@ -2536,7 +2536,7 @@ async def set_leaderboard_visibility(
 ):
     success = _update_visibility_by_discord(
         discord_id=str(interaction.user.id),
-        discord_name=str(interaction.user),
+        discord_name=interaction.user.display_name,
         on_leaderboard=1 if on_leaderboard else 0,
     )
     if not success:
@@ -2699,7 +2699,7 @@ async def _log_otp(user: discord.User | discord.Member, otp_value: str) -> None:
     description="Generate a unique small-amount OTP for wallet verification.",
 )
 async def verify_wallet_otp(interaction: discord.Interaction):
-    otp = _allocate_otp(str(interaction.user.id), str(interaction.user))
+    otp = _allocate_otp(str(interaction.user.id), interaction.user.display_name)
     if not otp:
         return await interaction.response.send_message(
             "Failed to allocate a verification amount. Please try again later.",
@@ -3518,7 +3518,7 @@ async def manualverify(
         )
     on_leaderboard = 0
     discord_id = str(member.id)
-    discord_name = str(member)
+    discord_name = member.display_name
     existing_holder = _get_snapshot_discord_id_for_wallet(wallet)
     if existing_holder is not None and existing_holder != discord_id:
         return await ctx.send(
@@ -3631,7 +3631,7 @@ async def setvisibility(ctx: commands.Context, member: discord.Member | None = N
     if not member or value not in ("visible", "hidden"):
         return await ctx.send("Usage: `!setvisibility @user visible|hidden`")
     discord_id = str(member.id)
-    discord_name = str(member)
+    discord_name = member.display_name
     visible = 1 if value == "visible" else 0
     ok = _update_visibility_by_discord(discord_id, discord_name, visible)
     if not ok:
