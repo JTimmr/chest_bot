@@ -9,7 +9,7 @@ Provides endpoints for stats, leaderboard, and recent transactions.
 import os
 import sqlite3
 from datetime import datetime, timezone
-from typing import List, Optional, Dict, Any, Tuple
+from typing import Callable, List, Optional, Dict, Any, Tuple
 
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -251,7 +251,7 @@ def _fetch_recent_transactions(limit: int = 20) -> List[Dict[str, Any]]:
         return []
 
 
-def create_api_app() -> FastAPI:
+def create_api_app(chest_value_getter: Callable[[], float] = lambda: 0.0) -> FastAPI:
     """Factory function to create the FastAPI application."""
     app = FastAPI(
         title="Chest Bot API",
@@ -326,8 +326,7 @@ def create_api_app() -> FastAPI:
         total_raised = _fetch_total_donations_usd()
         by_token = _fetch_total_by_token()
 
-        from holder_leaderboard_bot import _get_chest_value_usd
-        chest_value = _get_chest_value_usd()
+        chest_value = chest_value_getter()
         targets, next_target = _fetch_targets(chest_value)
 
         return {

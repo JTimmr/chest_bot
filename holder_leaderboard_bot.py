@@ -4412,7 +4412,7 @@ def main() -> None:
         import uvicorn
         from api_server import create_api_app
 
-        api_app = create_api_app()
+        api_app = create_api_app(chest_value_getter=_get_chest_value_usd)
         api_port = int(os.getenv("API_PORT", "8000"))
         api_host = os.getenv("API_HOST", "0.0.0.0")
 
