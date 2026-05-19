@@ -1438,19 +1438,32 @@ def _sync_snapshot_donations(
         log.warning("Failed to sync snapshot donations for %s: %s", sender_wallet, exc)
 
 
-def _set_summary_visibility(discord_id: str, visible: int) -> None:
+def _set_summary_visibility(discord_id: str, visible: int, discord_name: str | None = None) -> None:
     try:
         with _connect_db(SNAPSHOT_DB) as conn:
-            conn.execute(
-                f"""
-                INSERT INTO {SUMMARY_TABLE} (discord_id, leaderboard_visible, updated_at)
-                VALUES (?, ?, datetime('now'))
-                ON CONFLICT(discord_id) DO UPDATE SET
-                    leaderboard_visible = excluded.leaderboard_visible,
-                    updated_at = datetime('now')
-                """,
-                (discord_id, visible),
-            )
+            if discord_name:
+                conn.execute(
+                    f"""
+                    INSERT INTO {SUMMARY_TABLE} (discord_id, discord_name, leaderboard_visible, updated_at)
+                    VALUES (?, ?, ?, datetime('now'))
+                    ON CONFLICT(discord_id) DO UPDATE SET
+                        discord_name = excluded.discord_name,
+                        leaderboard_visible = excluded.leaderboard_visible,
+                        updated_at = datetime('now')
+                    """,
+                    (discord_id, discord_name, visible),
+                )
+            else:
+                conn.execute(
+                    f"""
+                    INSERT INTO {SUMMARY_TABLE} (discord_id, leaderboard_visible, updated_at)
+                    VALUES (?, ?, datetime('now'))
+                    ON CONFLICT(discord_id) DO UPDATE SET
+                        leaderboard_visible = excluded.leaderboard_visible,
+                        updated_at = datetime('now')
+                    """,
+                    (discord_id, visible),
+                )
             conn.commit()
     except sqlite3.Error as exc:
         log.error("Failed to set summary visibility: %s", exc)
@@ -2330,7 +2343,7 @@ class VerificationButtonsView(discord.ui.View):
                 ephemeral=True,
             )
         _update_visibility_by_discord(discord_id, interaction.user.display_name, 1)
-        _set_summary_visibility(discord_id, 1)
+        _set_summary_visibility(discord_id, 1, discord_name=interaction.user.display_name)
         recompute_summary_for_discord_id(discord_id)
         await interaction.response.send_message(
             "Your name is now **visible** on the leaderboard. You can change this anytime.",
@@ -2609,7 +2622,10 @@ async def set_leaderboard_visibility(
         "Updated leaderboard visibility.",
         ephemeral=True,
     )
-    _set_summary_visibility(discord_id, 1 if on_leaderboard else 0)
+    _set_summary_visibility(
+        discord_id, 1 if on_leaderboard else 0,
+        discord_name=interaction.user.display_name,
+    )
     recompute_summary_for_discord_id(discord_id)
     await bot._refresh_leaderboards()
 
@@ -3699,7 +3715,7 @@ async def setvisibility(ctx: commands.Context, member: discord.Member | None = N
         return await ctx.send(
             f"No verified wallet found for {member.mention}. They need to verify first."
         )
-    _set_summary_visibility(discord_id, visible)
+    _set_summary_visibility(discord_id, visible, discord_name=discord_name)
     await bot._refresh_leaderboards()
     label = "visible" if visible else "hidden"
     await ctx.send(f"Leaderboard visibility for {member.mention} set to **{label}**.")
