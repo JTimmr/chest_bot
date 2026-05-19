@@ -47,6 +47,7 @@ from incoming_tracker import (
     recompute_summary_for_discord_id,
     recompute_summary_for_wallet,
     recompute_all_verified_summaries,
+    fetch_war_chest_value_usd,
 )
 
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
@@ -72,6 +73,30 @@ OTP_TABLE = os.getenv("OTP_TABLE", "otp_registry")
 OTP_EXPIRY_SECONDS = int(os.getenv("OTP_EXPIRY_SECONDS", "3600"))
 COMMAND_CHANNEL_ID = os.getenv("COMMAND_CHANNEL_ID")
 _SNAPSHOT_COLUMNS: Set[str] | None = None
+
+_cached_chest_value_usd: float = 0.0
+
+
+async def _refresh_chest_value() -> float:
+    """Fetch the current on-chain war chest value and update the cache."""
+    global _cached_chest_value_usd
+    api_key = os.getenv("HELIUS_API_KEY")
+    target_wallet = os.getenv("WARCHEST_ADDRESS")
+    fartboy_mint = os.getenv("FARTBOY_MINT")
+    if not api_key or not target_wallet or not fartboy_mint:
+        return _cached_chest_value_usd
+    try:
+        value = await fetch_war_chest_value_usd(api_key, target_wallet, fartboy_mint)
+        _cached_chest_value_usd = value
+        log.info("War chest value refreshed: $%.2f", value)
+    except Exception as exc:
+        log.warning("Failed to refresh war chest value: %s", exc)
+    return _cached_chest_value_usd
+
+
+def _get_chest_value_usd() -> float:
+    """Return the last cached war chest USD value."""
+    return _cached_chest_value_usd
 
 
 def _connect_db(path: str) -> sqlite3.Connection:
@@ -1922,17 +1947,17 @@ def _render_progress_bar(current: float, target: float, width: int = 20) -> str:
     return f"`{bar}` {pct:.2f}%"
 
 
-def _render_target_field(total_raised: float) -> str | None:
+def _render_target_field(chest_value: float) -> str | None:
     """Build the target/milestone progress string for the embed."""
-    next_target = _fetch_next_target(total_raised)
+    next_target = _fetch_next_target()
     if not next_target:
         return None
     amount = next_target["target_amount"]
     name = next_target.get("target_name")
-    capped = min(total_raised, amount)
+    capped = min(chest_value, amount)
     bar = _render_progress_bar(capped, amount)
     label = f'{name} — ' if name else ""
-    return f"{label}${total_raised:,.2f} / ${amount:,.2f}\n{bar}"
+    return f"{label}${chest_value:,.2f} / ${amount:,.2f}\n{bar}"
 
 
 def _render_donations_embed(limit: int) -> discord.Embed:
@@ -1943,14 +1968,20 @@ def _render_donations_embed(limit: int) -> discord.Embed:
         color=0xFFD166,
         timestamp=datetime.now(timezone.utc),
     )
+    chest_value = _get_chest_value_usd()
     emb.add_field(
-        name="Total donations",
+        name="Raised",
         value=f"${total_donations:,.2f}",
-        inline=False,
+        inline=True,
+    )
+    emb.add_field(
+        name="Chest",
+        value=f"${chest_value:,.2f}",
+        inline=True,
     )
 
-    # Progress bar toward next target
-    target_text = _render_target_field(total_donations)
+    # Progress bar toward next target (based on current chest value)
+    target_text = _render_target_field(chest_value)
     if target_text:
         emb.add_field(
             name="Next target",
@@ -2335,6 +2366,7 @@ class LeaderboardBot(commands.Bot):
         self._live_enabled = _is_live_enabled()
         if self._tracker and self._live_enabled:
             self._tracker.unlimited_backfill = True
+        await _refresh_chest_value()
         if GUILD_ID:
             self.tree.clear_commands(guild=None)
             await self.tree.sync()
@@ -2443,6 +2475,7 @@ class LeaderboardBot(commands.Bot):
                 guild = self.get_guild(int(GUILD_ID))
                 if guild:
                     await sync_donor_roles(guild)
+            await _refresh_chest_value()
             log.info("Tracker tick complete. New transactions: %s", count)
         except Exception as exc:
             log.exception("Tracker tick failed: %s", exc)
@@ -3998,13 +4031,14 @@ async def targets_cmd(ctx: commands.Context):
     """Show all active fundraising targets."""
     targets = _fetch_targets()
     total_raised = _fetch_total_donations_usd()
+    chest_value = _get_chest_value_usd()
 
     if not targets:
         return await ctx.send("No active targets set. Admins can use `!settarget <amount> [name]`.")
 
-    lines = [f"**Total Raised: ${total_raised:,.2f}**\n"]
+    lines = [f"**Raised: ${total_raised:,.2f}** | **Chest: ${chest_value:,.2f}**\n"]
     for t in targets:
-        progress = (total_raised / t["target_amount"] * 100) if t["target_amount"] > 0 else 0
+        progress = (chest_value / t["target_amount"] * 100) if t["target_amount"] > 0 else 0
         progress = min(100.0, progress)
         status = "completed" if t["completed_at"] else f"{progress:.1f}%"
         label = f' "{t["target_name"]}"' if t["target_name"] else ""
@@ -4014,7 +4048,7 @@ async def targets_cmd(ctx: commands.Context):
 
     next_target = _fetch_next_target()
     if next_target:
-        progress = (total_raised / next_target["target_amount"] * 100) if next_target["target_amount"] > 0 else 0
+        progress = (chest_value / next_target["target_amount"] * 100) if next_target["target_amount"] > 0 else 0
         progress = min(100.0, progress)
         label = f' ({next_target["target_name"]})' if next_target.get("target_name") else ""
         lines.append(f"\n**Next target:** ${next_target['target_amount']:,.2f}{label} — {progress:.1f}%")

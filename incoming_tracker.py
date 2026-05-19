@@ -128,6 +128,12 @@ class HeliusRPCClient:
         res = await self._make_request("getTokenAccountsByOwner", params)
         return res.get("value", []) if res else []
 
+    async def get_balance(self, address: str) -> int:
+        """Get SOL balance in lamports for an address."""
+        params = [address, {"commitment": "finalized"}]
+        res = await self._make_request("getBalance", params)
+        return int(res.get("value", 0)) if res else 0
+
     async def get_token_supply(self, mint: str) -> Optional[Dict]:
         params = [mint, {"commitment": "finalized"}]
         res = await self._make_request("getTokenSupply", params)
@@ -1390,6 +1396,60 @@ async def _fetch_coingecko_price_usd(session: aiohttp.ClientSession, mint: str) 
     entry = payload.get(mint) or payload.get(mint.lower()) or {}
     price = entry.get("usd")
     return float(price) if price is not None else 0.0
+
+
+async def fetch_war_chest_value_usd(
+    api_key: str, target_wallet: str, fartboy_mint: str
+) -> float:
+    """Query the on-chain balances of the war chest and return total USD value."""
+    total_usd = 0.0
+    async with HeliusRPCClient(api_key, request_delay=0.2) as client:
+        sol_lamports = await client.get_balance(target_wallet)
+        sol_balance = sol_lamports / (10 ** SOL_DECIMALS)
+
+        fartboy_accounts = await client.get_token_accounts_by_owner(target_wallet, fartboy_mint)
+        usdc_accounts = await client.get_token_accounts_by_owner(target_wallet, USDC_MINT)
+        usdt_accounts = await client.get_token_accounts_by_owner(target_wallet, USDT_MINT)
+
+    def _parse_token_balance(accounts: List[Dict]) -> float:
+        total = 0.0
+        for acc in accounts:
+            info = acc.get("account", {}).get("data", {}).get("parsed", {}).get("info", {})
+            token_amount = info.get("tokenAmount", {})
+            ui_amount = token_amount.get("uiAmount")
+            if ui_amount is not None:
+                total += float(ui_amount)
+        return total
+
+    fartboy_balance = _parse_token_balance(fartboy_accounts)
+    usdc_balance = _parse_token_balance(usdc_accounts)
+    usdt_balance = _parse_token_balance(usdt_accounts)
+
+    total_usd += usdc_balance
+    total_usd += usdt_balance
+
+    async with aiohttp.ClientSession() as session:
+        if sol_balance > 0:
+            try:
+                sol_price = await _fetch_jupiter_price_usdc(session, SOL_MINT)
+            except Exception:
+                try:
+                    sol_price = await _fetch_coingecko_price_usd(session, SOL_MINT)
+                except Exception:
+                    sol_price = 0.0
+            total_usd += sol_balance * sol_price
+
+        if fartboy_balance > 0:
+            try:
+                fartboy_price = await _fetch_jupiter_price_usdc(session, fartboy_mint)
+            except Exception:
+                try:
+                    fartboy_price = await _fetch_coingecko_price_usd(session, fartboy_mint)
+                except Exception:
+                    fartboy_price = 0.0
+            total_usd += fartboy_balance * fartboy_price
+
+    return total_usd
 
 
 def _nearest_price(prices: List[List[float]], ts_seconds: int) -> float:
