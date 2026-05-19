@@ -1398,18 +1398,17 @@ async def _fetch_coingecko_price_usd(session: aiohttp.ClientSession, mint: str) 
     return float(price) if price is not None else 0.0
 
 
-async def fetch_war_chest_value_usd(
+async def fetch_war_chest_balances(
     api_key: str, target_wallet: str, fartboy_mint: str
-) -> float:
-    """Query the on-chain balances of the war chest and return total USD value."""
-    total_usd = 0.0
-    async with HeliusRPCClient(api_key, request_delay=0.2) as client:
-        sol_lamports = await client.get_balance(target_wallet)
-        sol_balance = sol_lamports / (10 ** SOL_DECIMALS)
+) -> Dict[str, Optional[float]]:
+    """Query on-chain balances of the war chest.
 
-        fartboy_accounts = await client.get_token_accounts_by_owner(target_wallet, fartboy_mint)
-        usdc_accounts = await client.get_token_accounts_by_owner(target_wallet, USDC_MINT)
-        usdt_accounts = await client.get_token_accounts_by_owner(target_wallet, USDT_MINT)
+    Returns a dict with keys SOL, FARTBOY, USDC, USDT.
+    A value of None means the RPC call failed for that asset.
+    """
+    result: Dict[str, Optional[float]] = {
+        "SOL": None, "FARTBOY": None, "USDC": None, "USDT": None,
+    }
 
     def _parse_token_balance(accounts: List[Dict]) -> float:
         total = 0.0
@@ -1421,35 +1420,59 @@ async def fetch_war_chest_value_usd(
                 total += float(ui_amount)
         return total
 
-    fartboy_balance = _parse_token_balance(fartboy_accounts)
-    usdc_balance = _parse_token_balance(usdc_accounts)
-    usdt_balance = _parse_token_balance(usdt_accounts)
+    async with HeliusRPCClient(api_key, request_delay=0.2) as client:
+        try:
+            sol_lamports = await client.get_balance(target_wallet)
+            result["SOL"] = sol_lamports / (10 ** SOL_DECIMALS)
+        except Exception:
+            pass
 
-    total_usd += usdc_balance
-    total_usd += usdt_balance
+        try:
+            fartboy_accounts = await client.get_token_accounts_by_owner(target_wallet, fartboy_mint)
+            result["FARTBOY"] = _parse_token_balance(fartboy_accounts)
+        except Exception:
+            pass
+
+        try:
+            usdc_accounts = await client.get_token_accounts_by_owner(target_wallet, USDC_MINT)
+            result["USDC"] = _parse_token_balance(usdc_accounts)
+        except Exception:
+            pass
+
+        try:
+            usdt_accounts = await client.get_token_accounts_by_owner(target_wallet, USDT_MINT)
+            result["USDT"] = _parse_token_balance(usdt_accounts)
+        except Exception:
+            pass
+
+    return result
+
+
+async def fetch_token_prices(fartboy_mint: str) -> Dict[str, Optional[float]]:
+    """Fetch current USD prices for SOL and FARTBOY.
+
+    Returns None for a token if all price sources failed.
+    """
+    result: Dict[str, Optional[float]] = {"SOL": None, "FARTBOY": None}
 
     async with aiohttp.ClientSession() as session:
-        if sol_balance > 0:
+        try:
+            result["SOL"] = await _fetch_jupiter_price_usdc(session, SOL_MINT)
+        except Exception:
             try:
-                sol_price = await _fetch_jupiter_price_usdc(session, SOL_MINT)
+                result["SOL"] = await _fetch_coingecko_price_usd(session, SOL_MINT)
             except Exception:
-                try:
-                    sol_price = await _fetch_coingecko_price_usd(session, SOL_MINT)
-                except Exception:
-                    sol_price = 0.0
-            total_usd += sol_balance * sol_price
+                pass
 
-        if fartboy_balance > 0:
+        try:
+            result["FARTBOY"] = await _fetch_jupiter_price_usdc(session, fartboy_mint)
+        except Exception:
             try:
-                fartboy_price = await _fetch_jupiter_price_usdc(session, fartboy_mint)
+                result["FARTBOY"] = await _fetch_coingecko_price_usd(session, fartboy_mint)
             except Exception:
-                try:
-                    fartboy_price = await _fetch_coingecko_price_usd(session, fartboy_mint)
-                except Exception:
-                    fartboy_price = 0.0
-            total_usd += fartboy_balance * fartboy_price
+                pass
 
-    return total_usd
+    return result
 
 
 def _nearest_price(prices: List[List[float]], ts_seconds: int) -> float:

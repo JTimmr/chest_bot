@@ -47,7 +47,8 @@ from incoming_tracker import (
     recompute_summary_for_discord_id,
     recompute_summary_for_wallet,
     recompute_all_verified_summaries,
-    fetch_war_chest_value_usd,
+    fetch_war_chest_balances,
+    fetch_token_prices,
 )
 
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
@@ -74,29 +75,57 @@ OTP_EXPIRY_SECONDS = int(os.getenv("OTP_EXPIRY_SECONDS", "3600"))
 COMMAND_CHANNEL_ID = os.getenv("COMMAND_CHANNEL_ID")
 _SNAPSHOT_COLUMNS: Set[str] | None = None
 
-_cached_chest_value_usd: float = 0.0
+_cached_balances: Dict[str, float] = {
+    "SOL": 0.0, "FARTBOY": 0.0, "USDC": 0.0, "USDT": 0.0,
+}
+_cached_prices: Dict[str, float] = {
+    "SOL": 0.0, "FARTBOY": 0.0,
+}
 
 
 async def _refresh_chest_value() -> float:
-    """Fetch the current on-chain war chest value and update the cache."""
-    global _cached_chest_value_usd
+    """Fetch on-chain balances and prices, updating only on successful responses."""
     api_key = os.getenv("HELIUS_API_KEY")
     target_wallet = os.getenv("WARCHEST_ADDRESS")
     fartboy_mint = os.getenv("FARTBOY_MINT")
     if not api_key or not target_wallet or not fartboy_mint:
-        return _cached_chest_value_usd
+        return _get_chest_value_usd()
+
     try:
-        value = await fetch_war_chest_value_usd(api_key, target_wallet, fartboy_mint)
-        _cached_chest_value_usd = value
-        log.info("War chest value refreshed: $%.2f", value)
+        balances = await fetch_war_chest_balances(api_key, target_wallet, fartboy_mint)
+        for token, value in balances.items():
+            if value is not None:
+                _cached_balances[token] = value
     except Exception as exc:
-        log.warning("Failed to refresh war chest value: %s", exc)
-    return _cached_chest_value_usd
+        log.warning("Failed to fetch war chest balances: %s", exc)
+
+    try:
+        prices = await fetch_token_prices(fartboy_mint)
+        for token, price in prices.items():
+            if price is not None and price > 0:
+                _cached_prices[token] = price
+    except Exception as exc:
+        log.warning("Failed to fetch token prices: %s", exc)
+
+    total = _get_chest_value_usd()
+    log.info(
+        "War chest refreshed: $%.2f (SOL=%.4f@$%.2f, FARTBOY=%.2f@$%.6f, USDC=%.2f, USDT=%.2f)",
+        total,
+        _cached_balances["SOL"], _cached_prices["SOL"],
+        _cached_balances["FARTBOY"], _cached_prices["FARTBOY"],
+        _cached_balances["USDC"], _cached_balances["USDT"],
+    )
+    return total
 
 
 def _get_chest_value_usd() -> float:
-    """Return the last cached war chest USD value."""
-    return _cached_chest_value_usd
+    """Compute war chest USD value from cached balances and prices."""
+    return (
+        _cached_balances["USDC"]
+        + _cached_balances["USDT"]
+        + _cached_balances["SOL"] * _cached_prices["SOL"]
+        + _cached_balances["FARTBOY"] * _cached_prices["FARTBOY"]
+    )
 
 
 def _connect_db(path: str) -> sqlite3.Connection:
