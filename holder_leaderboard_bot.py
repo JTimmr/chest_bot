@@ -1081,6 +1081,75 @@ def _format_remaining(assigned_at: Optional[str]) -> str:
     return f"{minutes}m {seconds}s"
 
 
+def _try_deferred_verification(discord_id: str) -> bool:
+    """Complete verification if OTP was already received but rejected for 1% not met.
+
+    Returns True if verification was completed, False otherwise.
+    """
+    try:
+        with _connect_db(SNAPSHOT_DB) as conn:
+            _ensure_otp_registry(conn)
+            _expire_otps(conn)
+            pending_otp = conn.execute(
+                f"""
+                SELECT otp_value, tick_size
+                FROM {OTP_TABLE}
+                WHERE assigned_to_discord_id = ? AND status = 'assigned'
+                ORDER BY assigned_at DESC LIMIT 1
+                """,
+                (discord_id,),
+            ).fetchone()
+            if not pending_otp:
+                return False
+            rej = conn.execute(
+                """
+                SELECT sender_wallet, signature
+                FROM verification_rejections
+                WHERE discord_id = ? AND reason = 'strict_below_1pct'
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                (discord_id,),
+            ).fetchone()
+            if not rej:
+                return False
+            sender_wallet, otp_signature = rej
+            gate = _check_strict_gate(conn, SNAPSHOT_TABLE, sender_wallet)
+            if gate is not None:
+                return False
+            otp_value, tick_size = pending_otp
+            matched = _match_assigned_otp(
+                conn, otp_value, tick_size, otp_signature, sender_wallet
+            )
+            if not matched:
+                return False
+            matched_discord_id, matched_name = matched
+            conn.execute(
+                f"""
+                UPDATE {SNAPSHOT_TABLE}
+                SET discord_id = ?, discord_name = ?, on_leaderboard = 0
+                WHERE wallet_address = ?
+                  AND (discord_id IS NULL OR discord_id = ?)
+                """,
+                (matched_discord_id, matched_name, sender_wallet, matched_discord_id),
+            )
+            conn.commit()
+            recompute_summary_for_discord_id(
+                matched_discord_id,
+                snapshot_db=SNAPSHOT_DB,
+                snapshot_table=SNAPSHOT_TABLE,
+                tx_db_path=TX_DB,
+                tx_table=TX_TABLE,
+            )
+            log.info(
+                "Deferred verification completed for %s (wallet %s)",
+                discord_id, sender_wallet,
+            )
+            return True
+    except sqlite3.Error as exc:
+        log.error("Deferred verification check failed: %s", exc)
+        return False
+
+
 def _is_leaderboard_visible(discord_id: str) -> bool:
     try:
         with _connect_db(SNAPSHOT_DB) as conn:
@@ -2776,7 +2845,13 @@ async def _log_otp(user: discord.User | discord.Member, otp_value: str) -> None:
     description="Generate a unique small-amount OTP for wallet verification.",
 )
 async def verify_wallet_otp(interaction: discord.Interaction):
-    otp = _allocate_otp(str(interaction.user.id), interaction.user.display_name)
+    discord_id = str(interaction.user.id)
+    if _try_deferred_verification(discord_id):
+        return await interaction.response.send_message(
+            "**Verified!** Your wallet has been linked. Use `/verifystatus` to see details.",
+            ephemeral=True,
+        )
+    otp = _allocate_otp(discord_id, interaction.user.display_name)
     if not otp:
         return await interaction.response.send_message(
             "Failed to allocate a verification amount. Please try again later.",
@@ -2785,7 +2860,7 @@ async def verify_wallet_otp(interaction: discord.Interaction):
     otp_value, tick = otp
     war_chest = os.getenv("WARCHEST_ADDRESS", "")
     await _log_otp(interaction.user, otp_value)
-    show_reminder = not _is_leaderboard_visible(str(interaction.user.id))
+    show_reminder = not _is_leaderboard_visible(discord_id)
     assigned_at = None
     try:
         with _connect_db(SNAPSHOT_DB) as conn:
@@ -2798,7 +2873,7 @@ async def verify_wallet_otp(interaction: discord.Interaction):
                   AND tick_size = ?
                   AND status = 'assigned'
                 """,
-                (str(interaction.user.id), otp_value, tick),
+                (discord_id, otp_value, tick),
             ).fetchone()
             assigned_at = row[0] if row else None
     except sqlite3.Error:
@@ -2872,6 +2947,8 @@ async def verify_status(interaction: discord.Interaction, signature: str | None 
         tx_db_path=TX_DB,
         tx_table=TX_TABLE,
     )
+
+    _try_deferred_verification(discord_id)
 
     verified_wallets = _find_wallets_for_discord_id(discord_id)
 
